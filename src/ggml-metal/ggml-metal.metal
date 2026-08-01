@@ -7331,6 +7331,40 @@ kernel void kernel_cont_f32(
     }
 }
 
+// Vectorized CPY kernel for F32→F16, contiguous rows with identical src/dst shape
+// (i.e. no reshape — a straight elementwise cast, as produced by ggml_cast()).
+// Each thread copies one full dim0 row using float4 loads + half4 stores, avoiding
+// the per-element int64 div/mod index decomposition that kernel_cpy_t_t performs
+// once per element (this kernel does it once per row, like kernel_cont_f32).
+// Host side only dispatches this when nb00 == sizeof(float), nb0 == sizeof(half),
+// and src/dst share the same ne00..ne03 (see ggml_metal_op_cpy) — i.e. exactly the
+// conditions under which the general per-element index math collapses to identity.
+kernel void kernel_cpy_f32_f16_4(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i03 = tgpig[2];
+    const int i02 = tgpig[1];
+    const int i01 = tgpig[0] * ntg[0] + tiitg;
+    if (i01 >= args.ne01) return;
+
+    device const char * src_base = src0 + (int64_t)i03*args.nb03 + (int64_t)i02*args.nb02 + (int64_t)i01*args.nb01;
+    device       half  * dst_row = (device half *)(dst + (int64_t)i03*args.nb3 + (int64_t)i02*args.nb2 + (int64_t)i01*args.nb1);
+
+    device const float4 * src4 = (device const float4 *) src_base;
+    device       half4  * dst4 = (device half4 *) dst_row;
+    const int n4 = (int) args.ne00 / 4;
+    for (int i = 0; i < n4; i++) {
+        dst4[i] = half4(src4[i]);
+    }
+    for (int i = n4 * 4; i < args.ne00; i++) {
+        dst_row[i] = (half) ((device const float *) src_base)[i];
+    }
+}
+
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,

@@ -1900,6 +1900,37 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
+    // Fast path: CPY F32→F16, contiguous rows, no reshape (src/dst share the same
+    // per-dim shape) — vectorized float4→half4 kernel, no per-element index decomposition.
+    if (op->op == GGML_OP_CPY &&
+        op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F16 &&
+        nb00 == sizeof(float) && nb0 == sizeof(ggml_fp16_t) &&
+        ne00 == (int32_t) ne0 && ne01 == (int32_t) ne1 && ne02 == (int32_t) ne2 && ne03 == (int32_t) ne3) {
+
+        ggml_metal_kargs_cpy args = {
+            /*.nk0  =*/ (int64_t) ne00,
+            /*.ne00 =*/ (int64_t) ne00, /*.ne01 =*/ (int64_t) ne01,
+            /*.ne02 =*/ (int64_t) ne02, /*.ne03 =*/ (int64_t) ne03,
+            /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+            /*.ne0  =*/ (int64_t) ne0, /*.ne1  =*/ (int64_t) ne1,
+            /*.ne2  =*/ (int64_t) ne2, /*.ne3  =*/ (int64_t) ne3,
+            /*.nb0  =*/ nb0, /*.nb1  =*/ nb1, /*.nb2  =*/ nb2, /*.nb3  =*/ nb3,
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_cpy_f32_f16_4(lib, op);
+        int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), (int) ne01);
+        nth = std::min(nth, 256);
+        int n_tg = (ne01 + nth - 1) / nth;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, ne02, ne03, nth, 1, 1);
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
 
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);

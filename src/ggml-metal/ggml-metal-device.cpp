@@ -1904,6 +1904,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cont_f32(ggml_me
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_f32_f16_4(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CPY);
+
+    const char * name = "kernel_cpy_f32_f16_4";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_arange(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ARANGE);
 
