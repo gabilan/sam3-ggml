@@ -52,6 +52,7 @@
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
+#include "ggml-cuda/win-part.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/set.cuh"
@@ -2814,6 +2815,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;
+        case GGML_OP_WIN_PART:
+            ggml_cuda_op_win_part(ctx, dst);
+            break;
+        case GGML_OP_WIN_UNPART:
+            ggml_cuda_op_win_unpart(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5025,6 +5032,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_PAD:
             return true;
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_UPSCALE:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_ARANGE:
