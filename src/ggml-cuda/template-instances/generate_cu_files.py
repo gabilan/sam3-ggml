@@ -3,7 +3,8 @@
 from glob import glob
 import os
 
-HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 256, 576]
+# 16/32: SAM3 mask-decoder / PVS (cross-attn 128/8, self-attn 256/8). Tile only.
+HEAD_SIZES_KQ = [16, 32, 40, 64, 72, 80, 96, 112, 128, 256, 576]
 
 TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
 
@@ -79,9 +80,7 @@ for ncols in [8, 16, 32, 64]:
             f.write(SOURCE_FATTN_MMA_START)
 
             for head_size_kq in HEAD_SIZES_KQ:
-                if head_size_kq == 40:
-                    continue
-                if head_size_kq == 72:
+                if head_size_kq in (16, 32, 40, 72):
                     continue
                 if head_size_kq != 576 and ncols2 in (16, 32):
                     continue
