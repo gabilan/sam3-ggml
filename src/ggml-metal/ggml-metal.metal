@@ -4883,34 +4883,47 @@ kernel void kernel_conv_transpose_2d(
 
     float sum = 0.0f;
 
-    // Mirror ggml_compute_forward_conv_transpose_2d():
-    // dst[out_x, out_y, out_c] gathers every kernel tap / input channel pair whose
-    // scatter target would land on this output coordinate in the CPU implementation.
-    for (int64_t kh = 0; kh < args.KH; ++kh) {
-        const int64_t in_y_nom = out_y - kh;
-        if (in_y_nom < 0 || in_y_nom % args.s0 != 0) {
-            continue;
-        }
-
-        const int64_t in_y = in_y_nom / args.s0;
-        if (in_y >= args.IH) {
-            continue;
-        }
-
-        for (int64_t kw = 0; kw < args.KW; ++kw) {
-            const int64_t in_x_nom = out_x - kw;
-            if (in_x_nom < 0 || in_x_nom % args.s0 != 0) {
+    // SAM3 SimpleFPN: all ConvTranspose are 2×2 / stride 2 (EWI-402 Metal parity
+    // with ggml-cuda conv2d_transpose_k2s2_kernel). One tap; same Cin FMA order.
+    if (args.KH == 2 && args.KW == 2 && args.s0 == 2 &&
+        args.OW == args.IW * 2 && args.OH == args.IH * 2) {
+        const int64_t kw = out_x & 1;
+        const int64_t kh = out_y & 1;
+        const int64_t in_x = out_x >> 1;
+        const int64_t in_y = out_y >> 1;
+        const int64_t input_base = in_y * args.IW + in_x;
+        const int64_t kernel_base = ((int64_t) out_c * args.KH + kh) * args.KW + kw;
+        sum = ggml_conv_transpose_2d_dot(args, src0, src1, input_base, kernel_base);
+    } else {
+        // Mirror ggml_compute_forward_conv_transpose_2d():
+        // dst[out_x, out_y, out_c] gathers every kernel tap / input channel pair whose
+        // scatter target would land on this output coordinate in the CPU implementation.
+        for (int64_t kh = 0; kh < args.KH; ++kh) {
+            const int64_t in_y_nom = out_y - kh;
+            if (in_y_nom < 0 || in_y_nom % args.s0 != 0) {
                 continue;
             }
 
-            const int64_t in_x = in_x_nom / args.s0;
-            if (in_x >= args.IW) {
+            const int64_t in_y = in_y_nom / args.s0;
+            if (in_y >= args.IH) {
                 continue;
             }
 
-            const int64_t input_base = in_y * args.IW + in_x;
-            const int64_t kernel_base = ((int64_t) out_c * args.KH + kh) * args.KW + kw;
-            sum += ggml_conv_transpose_2d_dot(args, src0, src1, input_base, kernel_base);
+            for (int64_t kw = 0; kw < args.KW; ++kw) {
+                const int64_t in_x_nom = out_x - kw;
+                if (in_x_nom < 0 || in_x_nom % args.s0 != 0) {
+                    continue;
+                }
+
+                const int64_t in_x = in_x_nom / args.s0;
+                if (in_x >= args.IW) {
+                    continue;
+                }
+
+                const int64_t input_base = in_y * args.IW + in_x;
+                const int64_t kernel_base = ((int64_t) out_c * args.KH + kh) * args.KW + kw;
+                sum += ggml_conv_transpose_2d_dot(args, src0, src1, input_base, kernel_base);
+            }
         }
     }
 
