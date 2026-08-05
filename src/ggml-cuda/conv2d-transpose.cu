@@ -1,6 +1,7 @@
 #include "conv2d-transpose.cuh"
 #include "convert.cuh"
 
+// Generic path: every output element loops Cin × Kh × Kw (with stride alignment skips).
 template <typename kernel_t>
 static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
                                                const kernel_t * __restrict__ kernel,
@@ -67,6 +68,51 @@ static __global__ void conv2d_transpose_kernel(const float * __restrict__ input,
     output[(out_w * out_h * c_out) * n_idx + (out_w * out_h) * c_idx + (out_w) *out_y_idx + out_x_idx] = accumulator;
 }
 
+// SAM3 SimpleFPN neck: all ConvTranspose are 2×2 / stride 2. Exactly one
+// (kh,kw)=(oy&1, ox&1) tap contributes; drop Kh/Kw loops + stride branches.
+// Bit-identical float accumulation vs the generic path (same FMAs, same order
+// over Cin). EWI-402.
+template <typename kernel_t>
+static __global__ void conv2d_transpose_k2s2_kernel(const float * __restrict__ input,
+                                                    const kernel_t * __restrict__ kernel,
+                                                    float * __restrict__ output,
+                                                    const int in_w,
+                                                    const int in_h,
+                                                    const int out_w,
+                                                    const int out_h,
+                                                    const int c_in,
+                                                    const int c_out,
+                                                    const int batches) {
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_elements = out_w * out_h * c_out * batches;
+    if (global_idx >= total_elements) {
+        return;
+    }
+
+    const int out_x = global_idx % out_w;
+    const int out_y = (global_idx / out_w) % out_h;
+    const int c_out_idx = (global_idx / (out_w * out_h)) % c_out;
+    const int n_idx = global_idx / (out_w * out_h * c_out);
+
+    const int kw = out_x & 1;
+    const int kh = out_y & 1;
+    const int in_x = out_x >> 1;
+    const int in_y = out_y >> 1;
+
+    float accumulator = 0.0f;
+    const int in_plane = in_w * in_h;
+    const int kern_plane = 4 * c_out; // 2*2*c_out
+    const int kern_tap = 2 * kh + kw;
+
+    for (int c_in_idx = 0; c_in_idx < c_in; ++c_in_idx) {
+        const int input_idx = (in_plane * c_in) * n_idx + in_plane * c_in_idx + in_w * in_y + in_x;
+        const int kernel_idx = kern_plane * c_in_idx + 4 * c_out_idx + kern_tap;
+        accumulator += input[input_idx] * ggml_cuda_cast<float>(kernel[kernel_idx]);
+    }
+
+    output[(out_w * out_h * c_out) * n_idx + (out_w * out_h) * c_out_idx + out_w * out_y + out_x] = accumulator;
+}
+
 //input is (W, H, C_in, N), Kernel is (W, H, C_out, C_in)
 void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
@@ -101,6 +147,22 @@ void ggml_cuda_conv_2d_transpose_p0(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const int total  = output_w * output_h * channels_out * batches;
     const int blocks = (total + CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE - 1) / CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE;
+
+    const bool k2s2 = (kernel_w == 2 && kernel_h == 2 && stride == 2 &&
+                       output_w == input_w * 2 && output_h == input_h * 2);
+
+    if (k2s2) {
+        if (kernel->type == GGML_TYPE_F16) {
+            conv2d_transpose_k2s2_kernel<half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
+                input_data, (const half *) kernel_data, output_data, input_w, input_h, output_w, output_h,
+                channels_in, channels_out, batches);
+        } else {
+            conv2d_transpose_k2s2_kernel<float><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
+                input_data, (const float *) kernel_data, output_data, input_w, input_h, output_w, output_h,
+                channels_in, channels_out, batches);
+        }
+        return;
+    }
 
     if (kernel->type == GGML_TYPE_F16) {
         conv2d_transpose_kernel<half><<<blocks, CUDA_CONV2D_TRANSPOSE_BLOCK_SIZE, 0, st>>>(
