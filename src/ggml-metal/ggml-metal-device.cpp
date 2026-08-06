@@ -1730,6 +1730,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_2d_k2s2_fused(
+        ggml_metal_library_t lib, const ggml_tensor * weight, bool apply_gelu) {
+    GGML_ASSERT(weight);
+    GGML_ASSERT(weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_F32);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_conv_transpose_2d_k2s2_fused_%s_f32", ggml_type_name(weight->type));
+    snprintf(name, 256, "%s", base);
+    (void) apply_gelu; // selected at runtime via kargs.apply_gelu
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_2d(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_CONV_2D);
 

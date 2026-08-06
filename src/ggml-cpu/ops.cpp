@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -6945,6 +6946,68 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
     GGML_ASSERT(nb00 == ggml_type_size(src0->type));
     GGML_ASSERT(nb10 == sizeof(float));
 
+    const int32_t stride = ggml_get_op_params_i32(dst, 0);
+
+    // SAM3 SimpleFPN k2s2 fast path: skip full-tensor wdata permutes. Gather a
+    // Cin column per tap and reuse ggml_vec_dot_* so results stay bit-compatible
+    // with the legacy permute+dot path (and with Metal's k2s2 kernel).
+    if (ne00 == 2 && ne01 == 2 && stride == 2 &&
+        ne0 == ne10 * 2 && ne1 == ne11 * 2 &&
+        ne12 == ne03 && ne3 == ne13 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        ggml_barrier(params->threadpool);
+
+        const int64_t OC = ne02;
+        const int64_t IC = ne03;
+        const int64_t IW = ne10;
+        const int64_t IH = ne11;
+        const int64_t OW = ne0;
+        const int64_t N  = ne3;
+
+        const int64_t np = N * OC;
+        const int64_t dp = (np + nth - 1) / nth;
+        const int64_t ip0 = dp * ith;
+        const int64_t ip1 = MIN(ip0 + dp, np);
+
+        std::vector<kernel_t> xcol((size_t) IC);
+        std::vector<kernel_t> wcol((size_t) IC);
+
+        for (int64_t ip = ip0; ip < ip1; ++ip) {
+            const int64_t n  = ip / OC;
+            const int64_t oc = ip - n * OC;
+            float * dst_plane = (float *) ((char *) dst->data + n * nb3 + oc * nb2);
+            for (int64_t iy = 0; iy < IH; ++iy) {
+                for (int64_t ix = 0; ix < IW; ++ix) {
+                    for (int64_t ic = 0; ic < IC; ++ic) {
+                        const float x = *(const float *) ((const char *) src1->data
+                                + n * nb13 + ic * nb12 + iy * nb11 + ix * nb10);
+                        if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
+                            xcol[(size_t) ic] = GGML_CPU_FP32_TO_FP16(x);
+                        } else {
+                            xcol[(size_t) ic] = (kernel_t) x;
+                        }
+                    }
+                    for (int64_t kh = 0; kh < 2; ++kh) {
+                        for (int64_t kw = 0; kw < 2; ++kw) {
+                            for (int64_t ic = 0; ic < IC; ++ic) {
+                                wcol[(size_t) ic] = *(const kernel_t *) ((const char *) src0->data
+                                        + ic * nb03 + oc * nb02 + kh * nb01 + kw * nb00);
+                            }
+                            float sum = 0.0f;
+                            if constexpr (std::is_same_v<kernel_t, ggml_fp16_t>) {
+                                ggml_vec_dot_f16((int) IC, &sum, 0, xcol.data(), 0, wcol.data(), 0, 1);
+                            } else {
+                                ggml_vec_dot_f32((int) IC, &sum, 0, xcol.data(), 0, wcol.data(), 0, 1);
+                            }
+                            dst_plane[(iy * 2 + kh) * OW + (ix * 2 + kw)] = sum;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (ith == 0) {
         memset(params->wdata, 0, params->wsize);
 
@@ -6986,8 +7049,6 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
         memset(dst->data, 0, ggml_nbytes(dst));
     }
     ggml_barrier(params->threadpool);
-
-    const int32_t stride = ggml_get_op_params_i32(dst, 0);
 
     // total patches in dst
     const int np = ne2;

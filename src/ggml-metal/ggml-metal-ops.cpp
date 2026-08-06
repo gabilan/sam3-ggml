@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <unordered_set>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -101,6 +102,11 @@ struct ggml_metal_op {
     int debug_graph;
     int debug_fusion;
 
+    // Nodes already produced by a fused kernel earlier in this encode pass
+    // (e.g. ADD+GELU after fused k2s2 ConvTranspose). Must not jump idx over
+    // unrelated interleaved neck nodes — only skip these when reached.
+    std::unordered_set<ggml_tensor *> fused_skip;
+
 private:
     ggml_cgraph * gf;
 
@@ -182,6 +188,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     uint64_t concurrency_us = 0;
 
     //GGML_LOG_INFO("%s: encoding node %3d, op = %8s\n", __func__, idx, ggml_op_name(node->op));
+
+    if (ctx->fused_skip.erase(node)) {
+        return 1;
+    }
 
     if (ggml_is_empty(node)) {
         return 1;
@@ -3877,6 +3887,23 @@ int ggml_metal_op_conv_transpose_1d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Unwrap REPEAT/RESHAPE/VIEW/... to the F32 channel bias vector for neck fusion.
+// Peels broadcast views first (REPEAT of a [OC] bias has full spat*OC elems).
+static const ggml_tensor * ggml_metal_unwrap_channel_bias(const ggml_tensor * t, int32_t oc) {
+    for (int u = 0; u < 8 && t; ++u) {
+        if (t->op == GGML_OP_REPEAT || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+            t->op == GGML_OP_CONT || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) {
+            t = t->src[0];
+            continue;
+        }
+        if ((int) ggml_nelements(t) == oc && t->type == GGML_TYPE_F32) {
+            return t;
+        }
+        return nullptr;
+    }
+    return (t && (int) ggml_nelements(t) == oc && t->type == GGML_TYPE_F32) ? t : nullptr;
+}
+
 int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3905,6 +3932,93 @@ int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
     const int32_t ON = op->ne[3];
 
     GGML_ASSERT(ON == 1);
+
+    // SAM3 SimpleFPN: ConvT k2s2 + broadcast bias (+ optional gelu_erf).
+    // Search the full encoder node list (neck scales share vit `x` and often
+    // interleave). Write into gelu/add; skip those nodes later via fused_skip.
+    if (ctx->use_fusion && KW == 2 && KH == 2 && s0 == 2 &&
+        OW == IW * 2 && OH == IH * 2 &&
+        ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
+        ggml_tensor * add  = nullptr;
+        ggml_tensor * gelu = nullptr;
+        const ggml_tensor * bias_side = nullptr;
+
+        for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
+            ggml_tensor * cand = ctx->node(j);
+            if (!cand || cand->op != GGML_OP_ADD) {
+                continue;
+            }
+            if (cand->src[0] == op) {
+                add = cand;
+                bias_side = cand->src[1];
+                break;
+            }
+            if (cand->src[1] == op) {
+                add = cand;
+                bias_side = cand->src[0];
+                break;
+            }
+        }
+
+        const ggml_tensor * bias_vec = add ? ggml_metal_unwrap_channel_bias(bias_side, OC) : nullptr;
+        if (bias_vec) {
+            for (int j = idx + 1; j < ctx->n_nodes(); ++j) {
+                ggml_tensor * cand = ctx->node(j);
+                if (cand && cand->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(cand) == GGML_UNARY_OP_GELU_ERF &&
+                    cand->src[0] == add) {
+                    gelu = cand;
+                    break;
+                }
+            }
+
+            ggml_tensor * fuse_dst = gelu ? gelu : add;
+            if (fuse_dst && ggml_is_contiguous(fuse_dst) &&
+                fuse_dst->type == GGML_TYPE_F32 &&
+                fuse_dst->ne[0] == OW && fuse_dst->ne[1] == OH && fuse_dst->ne[2] == OC) {
+                ggml_metal_kargs_conv_transpose_2d_k2s2_fused fargs = {
+                    /*.IC         =*/ IC,
+                    /*.IH         =*/ IH,
+                    /*.IW         =*/ IW,
+                    /*.OC         =*/ OC,
+                    /*.OH         =*/ OH,
+                    /*.OW         =*/ OW,
+                    /*.apply_gelu =*/ gelu ? 1 : 0,
+                    /*.nb0        =*/ (uint64_t) fuse_dst->nb[0],
+                    /*.nb1        =*/ (uint64_t) fuse_dst->nb[1],
+                    /*.nb2        =*/ (uint64_t) fuse_dst->nb[2],
+                    /*.nb3        =*/ (uint64_t) fuse_dst->nb[3],
+                };
+
+                auto pipeline = ggml_metal_library_get_pipeline_conv_transpose_2d_k2s2_fused(
+                        lib, op->src[0], gelu != nullptr);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes (enc, &fargs, sizeof(fargs), 0);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias_vec),   3);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(fuse_dst),   4);
+
+                constexpr int32_t nth = 128;
+                const int32_t total = OW * OH * OC;
+                ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
+
+                ctx->fused_skip.insert(add);
+                if (gelu) {
+                    ctx->fused_skip.insert(gelu);
+                }
+                // Register the actual write target for concurrency tracking
+                // (encode_impl only sees the CONV_T node for n_fuse==1).
+                if (!ggml_metal_op_concurrency_add(ctx, fuse_dst)) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+                if (ctx->debug_fusion > 0) {
+                    GGML_LOG_DEBUG("%s: fuse CONV_T+BIAS%s\n", __func__, gelu ? "+GELU_ERF" : "");
+                }
+                return 1;
+            }
+        }
+    }
 
     ggml_metal_kargs_conv_transpose_2d args = {
         /*.IC  =*/ IC,

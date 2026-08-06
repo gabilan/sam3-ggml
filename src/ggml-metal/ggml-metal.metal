@@ -4947,6 +4947,69 @@ kernel void kernel_conv_transpose_2d<half>(
     device        char * dst,
     uint gid[[thread_position_in_grid]]);
 
+// SAM3 SimpleFPN: k2s2 ConvTranspose + channel bias (+ optional gelu_erf).
+// Same Cin FMA order as kernel_conv_transpose_2d k2s2 path; epilogue matches
+// CUDA ggml_cuda_conv_2d_transpose_k2s2_bias.
+template <typename T>
+kernel void kernel_conv_transpose_2d_k2s2_fused(
+        constant ggml_metal_kargs_conv_transpose_2d_k2s2_fused & args,
+        device const T     * src0,   // weights [KW,KH,OC,IC]
+        device const float * src1,   // input   [IW,IH,IC,1]
+        device const float * bias,   // [OC]
+        device        char * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t total = (int64_t) args.OW * args.OH * args.OC;
+    if ((int64_t) gid >= total) {
+        return;
+    }
+
+    const int64_t out_x = gid % args.OW;
+    const int64_t rem0  = gid / args.OW;
+    const int64_t out_y = rem0 % args.OH;
+    const int64_t out_c = rem0 / args.OH;
+
+    const int64_t kw = out_x & 1;
+    const int64_t kh = out_y & 1;
+    const int64_t in_x = out_x >> 1;
+    const int64_t in_y = out_y >> 1;
+    const int64_t input_base = in_y * args.IW + in_x;
+    // kernel layout [KW,KH,OC,IC]: base for (kw,kh,out_c,*) then + in_c * (OC*KH*KW)
+    const int64_t kernel_base = ((int64_t) out_c * 2 + kh) * 2 + kw;
+
+    // Cin loop mirrors ggml_conv_transpose_2d_dot float path (f32 accum).
+    float sum = 0.0f;
+    for (int64_t in_c = 0; in_c < args.IC; ++in_c) {
+        const int64_t input_idx  = ((int64_t) in_c * args.IH * args.IW) + input_base;
+        const int64_t kernel_idx = ((int64_t) in_c * args.OC * 2 * 2) + kernel_base;
+        sum += (float) src0[kernel_idx] * src1[input_idx];
+    }
+    sum += bias[out_c];
+    if (args.apply_gelu != 0) {
+        sum = 0.5f * sum * (1.0f + (float) erf_approx(SQRT_2_INV * sum));
+    }
+
+    device float * dst_ptr = (device float *) (dst + out_x * args.nb0 + out_y * args.nb1 + out_c * args.nb2);
+    dst_ptr[0] = sum;
+}
+
+template [[host_name("kernel_conv_transpose_2d_k2s2_fused_f32_f32")]]
+kernel void kernel_conv_transpose_2d_k2s2_fused<float>(
+    constant ggml_metal_kargs_conv_transpose_2d_k2s2_fused & args,
+    device const float * src0,
+    device const float * src1,
+    device const float * bias,
+    device        char * dst,
+    uint gid[[thread_position_in_grid]]);
+
+template [[host_name("kernel_conv_transpose_2d_k2s2_fused_f16_f32")]]
+kernel void kernel_conv_transpose_2d_k2s2_fused<half>(
+    constant ggml_metal_kargs_conv_transpose_2d_k2s2_fused & args,
+    device const half  * src0,
+    device const float * src1,
+    device const float * bias,
+    device        char * dst,
+    uint gid[[thread_position_in_grid]]);
+
 constant bool FC_upscale_aa [[function_constant(FC_UPSCALE + 0)]];
 
 kernel void kernel_upscale_nearest_f32(

@@ -602,6 +602,22 @@ typedef struct {
     uint64_t nb3;
 } ggml_metal_kargs_conv_transpose_2d;
 
+// Fused k2s2 ConvTranspose + channel bias (+ optional gelu_erf). Parity with
+// CUDA ggml_cuda_conv_2d_transpose_k2s2_bias (SAM3 SimpleFPN neck).
+typedef struct {
+    int32_t  IC;
+    int32_t  IH;
+    int32_t  IW;
+    int32_t  OC;
+    int32_t  OH;
+    int32_t  OW;
+    int32_t  apply_gelu; // 0/1
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_conv_transpose_2d_k2s2_fused;
+
 typedef struct {
     uint64_t nb00;
     uint64_t nb01;
