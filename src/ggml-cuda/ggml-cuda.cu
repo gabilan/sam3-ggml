@@ -3326,6 +3326,102 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
     return true;
 }
 
+// Inplace variant of the NORM+MUL(+ADD) fusion check. sam3-style layer-norm
+// chains are built with ggml_mul_inplace/ggml_add_inplace (views over the
+// norm buffer), which ggml_can_fuse rejects wholesale — a view might alias a
+// buffer someone else reads. Converting the graphs to non-inplace instead
+// measured +22 ms on a 5090 SAM3 encode (the chain leaves L2), so this
+// checker accepts exactly the inplace chain: every view roots at the norm
+// node itself and nothing else consumes the intermediates. The fused kernel
+// (norm.cu norm_f32<*, true, true>) is alias-safe: each output element is
+// read before written by the same thread, so dst == norm buffer is fine.
+static bool ggml_cuda_can_fuse_norm_inplace(const struct ggml_cgraph * cgraph, int node_idx, int n_ops) {
+    GGML_ASSERT(n_ops == 2 || n_ops == 3);
+    // Isolated A/B gate (the global GGML_CUDA_DISABLE_FUSION also disables the
+    // unrelated mul_mat epilogue fusions, which confounds measurements).
+    static const bool disable_norm_fusion = getenv("GGML_CUDA_DISABLE_NORM_FUSION") != nullptr;
+    if (disable_norm_fusion) {
+        return false;
+    }
+    if (node_idx + n_ops > cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * norm = cgraph->nodes[node_idx];
+    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add  = n_ops == 3 ? cgraph->nodes[node_idx + 2] : nullptr;
+
+    if (norm->op != GGML_OP_NORM || mul->op != GGML_OP_MUL || (add && add->op != GGML_OP_ADD)) {
+        return false;
+    }
+    if (!(norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(mul->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        (add && !(add->flags & GGML_TENSOR_FLAG_COMPUTE))) {
+        return false;
+    }
+
+    // The norm must own its buffer, feed only the mul, and not be an output.
+    // (ggml_node_get_use_count also counts views of norm as consumers, so a
+    // stray view of the intermediate elsewhere in the graph rejects here.)
+    if (norm->view_src || (norm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    if (mul->src[0] != norm && mul->src[1] != norm) {
+        return false;
+    }
+    if (!ggml_are_same_shape(mul, norm)) {
+        return false;
+    }
+    // Views are allowed only when they alias the norm buffer (inplace chain).
+    if (mul->view_src && mul->view_src != norm) {
+        return false;
+    }
+    if (add) {
+        if (mul->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return false;
+        }
+        if (ggml_node_get_use_count(cgraph, node_idx + 1) != 1) {
+            return false;
+        }
+        if (add->src[0] != mul && add->src[1] != mul) {
+            return false;
+        }
+        if (!ggml_are_same_shape(add, mul)) {
+            return false;
+        }
+        // add_inplace's view_src collapses to the chain root (norm).
+        if (add->view_src && add->view_src != norm && add->view_src != mul) {
+            return false;
+        }
+    }
+
+    // Same dtype / layout constraints as the generic RMS/NORM fusion path.
+    if (norm->src[0]->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (add && (add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+                add->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    // if norm is the B operand, then we don't handle broadcast
+    if (norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], norm)) {
+        return false;
+    }
+    // the kernel assumes contiguous rows
+    if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+        return false;
+    }
+    if (add && (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous_rows(add->src[1]))) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3386,7 +3482,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return false;
     }
 
-    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+    // NORM (layer norm) shares the RMS_NORM fusion constraints: same
+    // f32-only, broadcast-on-mul/add, contiguous-rows kernel contract
+    // (norm.cu norm_f32 mirrors rms_norm_f32's fused template).
+    if ((ops.size() == 2 || ops.size() == 3) &&
+        (ops.begin()[0] == GGML_OP_RMS_NORM || ops.begin()[0] == GGML_OP_NORM) &&
+        ops.begin()[1] == GGML_OP_MUL) {
         const ggml_tensor *rms_norm = cgraph->nodes[node_idx];
         const ggml_tensor *mul      = cgraph->nodes[node_idx+1];
         const ggml_tensor *add      = nullptr;
@@ -4187,6 +4288,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
                         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1]);
+                        i++;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD}, {}) ||
+                        ggml_cuda_can_fuse_norm_inplace(cgraph, i, 3)) {
+                        ggml_cuda_op_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+                        i += 2;
+                        continue;
+                    }
+
+                    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL}, {}) ||
+                        ggml_cuda_can_fuse_norm_inplace(cgraph, i, 2)) {
+                        ggml_cuda_op_norm_fused(*cuda_ctx, node, cgraph->nodes[i+1]);
                         i++;
                         continue;
                     }
