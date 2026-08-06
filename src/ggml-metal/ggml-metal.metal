@@ -9734,15 +9734,31 @@ kernel void kernel_mul_mm(
             device const float * bv = (device const float *) bias + r0;
             device float * D = (device float *) dst + im*args.ne1*args.ne0;
 
-            for (int t = tiitg; t < (int) nr0*nr1; t += 128) {
-                const short i = t % nr0;
-                const short j = t / nr0;
+            if (nr0 % 4 == 0 && args.ne0 % 4 == 0) {
+                // vectorized drain: rows are 16B-aligned (r0 is a multiple of 64)
+                const int n4 = (nr0/4)*nr1;
+                for (int t = tiitg; t < n4; t += 128) {
+                    const short i4 = t % (nr0/4);
+                    const short j  = t / (nr0/4);
 
-                float v = stage[j*NR0 + i] + bv[i];
-                if (FC_mul_mm_gelu) {
-                    v = 0.5f*v*(1.0f + erf_approx<float>(v*SQRT_2_INV));
+                    float4 v = *(threadgroup const float4 *)(stage + j*NR0 + 4*i4);
+                    v += *(device const float4 *)(bv + 4*i4);
+                    if (FC_mul_mm_gelu) {
+                        v = 0.5f*v*(1.0f + erf_approx(v*SQRT_2_INV));
+                    }
+                    *(device float4 *)(D + (r1 + j)*args.ne0 + r0 + 4*i4) = v;
                 }
-                D[(r1 + j)*args.ne0 + r0 + i] = v;
+            } else {
+                for (int t = tiitg; t < (int) nr0*nr1; t += 128) {
+                    const short i = t % nr0;
+                    const short j = t / nr0;
+
+                    float v = stage[j*NR0 + i] + bv[i];
+                    if (FC_mul_mm_gelu) {
+                        v = 0.5f*v*(1.0f + erf_approx<float>(v*SQRT_2_INV));
+                    }
+                    D[(r1 + j)*args.ne0 + r0 + i] = v;
+                }
             }
         } else if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
