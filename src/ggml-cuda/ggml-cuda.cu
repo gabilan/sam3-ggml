@@ -3637,6 +3637,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // Nodes whose results were already produced by a fused kernel earlier
+            // in this evaluate pass (e.g. ADD+GELU after fused k2s2 transpose).
+            std::unordered_set<ggml_tensor *> fused_skip;
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -3767,6 +3771,111 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                         ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
                         i += 2;
+                        continue;
+                    }
+
+                    // SAM3 SimpleFPN: ConvTranspose k2s2 + broadcast bias + gelu_erf.
+                    // Neck scales share the same vit `x`, so independent deconvs
+                    // often interleave in the cgraph — search the full tail, not
+                    // a tiny window. Write fused result into gelu; skip only
+                    // add+gelu later (never jump i over unrelated nodes).
+                    if (node->op == GGML_OP_CONV_TRANSPOSE_2D) {
+                        ggml_tensor * conv = node;
+                        ggml_tensor * add  = nullptr;
+                        ggml_tensor * gelu = nullptr;
+                        const ggml_tensor * bias_side = nullptr;
+
+                        for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                            ggml_tensor * cand = cgraph->nodes[j];
+                            if (!cand || cand->op != GGML_OP_ADD) {
+                                continue;
+                            }
+                            if (cand->src[0] == conv) {
+                                add = cand;
+                                bias_side = cand->src[1];
+                                break;
+                            }
+                            if (cand->src[1] == conv) {
+                                add = cand;
+                                bias_side = cand->src[0];
+                                break;
+                            }
+                        }
+
+                        if (add && bias_side) {
+                            const ggml_tensor * bias_vec = bias_side;
+                            for (int u = 0; u < 8 && bias_vec; ++u) {
+                                if ((int) ggml_nelements(bias_vec) == (int) conv->ne[2] &&
+                                    bias_vec->type == GGML_TYPE_F32 &&
+                                    bias_vec->op == GGML_OP_NONE) {
+                                    break;
+                                }
+                                if ((int) ggml_nelements(bias_vec) == (int) conv->ne[2] &&
+                                    bias_vec->type == GGML_TYPE_F32 &&
+                                    bias_vec->src[0] == nullptr) {
+                                    break;
+                                }
+                                if (bias_vec->op == GGML_OP_REPEAT || bias_vec->op == GGML_OP_RESHAPE ||
+                                    bias_vec->op == GGML_OP_VIEW || bias_vec->op == GGML_OP_CONT ||
+                                    bias_vec->op == GGML_OP_PERMUTE || bias_vec->op == GGML_OP_TRANSPOSE) {
+                                    bias_vec = bias_vec->src[0];
+                                } else {
+                                    // leaf weight / constant
+                                    if ((int) ggml_nelements(bias_vec) == (int) conv->ne[2] &&
+                                        bias_vec->type == GGML_TYPE_F32) {
+                                        break;
+                                    }
+                                    bias_vec = nullptr;
+                                    break;
+                                }
+                            }
+                            if (bias_vec && (int) ggml_nelements(bias_vec) == (int) conv->ne[2] &&
+                                bias_vec->type == GGML_TYPE_F32) {
+                                for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                                    ggml_tensor * cand = cgraph->nodes[j];
+                                    if (cand && cand->op == GGML_OP_UNARY &&
+                                        ggml_get_unary_op(cand) == GGML_UNARY_OP_GELU_ERF &&
+                                        cand->src[0] == add) {
+                                        gelu = cand;
+                                        break;
+                                    }
+                                }
+                            }
+                            static int s_fuse_hits = 0;
+                            static int s_fuse_miss = 0;
+                            static const bool s_fuse_log = getenv("SAM3_FUSION_LOG") != nullptr;
+                            ggml_tensor * fuse_dst = gelu ? gelu : add;
+                            const bool with_gelu = gelu != nullptr;
+                            if (bias_vec && fuse_dst &&
+                                ggml_cuda_conv_2d_transpose_k2s2_bias(
+                                    *cuda_ctx, conv->src[0], conv->src[1], bias_vec, fuse_dst, with_gelu)) {
+                                fused_skip.insert(add);
+                                if (gelu) {
+                                    fused_skip.insert(gelu);
+                                }
+                                if (s_fuse_log && s_fuse_hits < 48) {
+                                    fprintf(stderr,
+                                        "sam3_fuse: hit CONV_T+BIAS%s i=%d c_in=%lld c_out=%lld out=%lldx%lld\n",
+                                        with_gelu ? "+GELU_ERF" : "", i,
+                                        (long long) conv->src[1]->ne[2], (long long) conv->ne[2],
+                                        (long long) fuse_dst->ne[0], (long long) fuse_dst->ne[1]);
+                                }
+                                s_fuse_hits++;
+                                continue; // skip default CONV_TRANSPOSE compute
+                            } else if (s_fuse_log && s_fuse_miss < 16 && bias_vec) {
+                                fprintf(stderr,
+                                    "sam3_fuse: kernel reject i=%d k=%lldx%lld out=%lldx%lld in=%lldx%lld gelu=%d\n",
+                                    i, (long long) conv->src[0]->ne[0], (long long) conv->src[0]->ne[1],
+                                    (long long) conv->ne[0], (long long) conv->ne[1],
+                                    (long long) conv->src[1]->ne[0], (long long) conv->src[1]->ne[1],
+                                    with_gelu);
+                                s_fuse_miss++;
+                            }
+                        }
+                    }
+
+                    if (fused_skip.count(node)) {
+                        fused_skip.erase(node);
                         continue;
                     }
 
