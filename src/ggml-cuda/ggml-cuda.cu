@@ -29,6 +29,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mm-epilogue.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1374,6 +1375,13 @@ static void ggml_cuda_op_mul_mat_cublas(
                         &beta,   dst_dd_i, CUDA_R_32F, ldc,
                         CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            if (ctx.mm_epilogue_bias && ctx.mm_epilogue_ne0 == row_diff && id == ctx.device) {
+                ggml_cuda_op_mm_row_bias(ctx, dst_dd_i, ctx.mm_epilogue_bias,
+                        ctx.mm_epilogue_ne0, row_diff * src1_ncols, ctx.mm_epilogue_gelu);
+                ctx.mm_epilogue_bias = nullptr;
+                ctx.mm_epilogue_ne0  = 0;
+                ctx.mm_epilogue_gelu = false;
+            }
         } else {
             ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
@@ -1389,8 +1397,16 @@ static void ggml_cuda_op_mul_mat_cublas(
                         CUBLAS_COMPUTE_16F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
-            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
-            to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+            if (ctx.mm_epilogue_bias && ctx.mm_epilogue_ne0 == row_diff && id == ctx.device) {
+                ggml_cuda_op_mm_f16_to_f32_bias(ctx, dst_f16.get(), dst_dd_i, ctx.mm_epilogue_bias,
+                        ctx.mm_epilogue_ne0, row_diff * src1_ncols, ctx.mm_epilogue_gelu);
+                ctx.mm_epilogue_bias = nullptr;
+                ctx.mm_epilogue_ne0  = 0;
+                ctx.mm_epilogue_gelu = false;
+            } else {
+                const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+                to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+            }
         }
     } else {
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
@@ -4075,7 +4091,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             continue;
                         }
 
-                        if (bias_op == GGML_OP_ADD && !ggml_are_same_shape(bias_node->src[0], bias_node->src[1])) {
+                        const bool same_shape_bias = ggml_are_same_shape(bias_node->src[0], bias_node->src[1]);
+
+                        // Contiguous row bias [ne0] on mul_mat [ne0, …] — ViT
+                        // linears after spatial flatten (N≫1, cuBLAS path).
+                        const bool row_bias =
+                            bias_op == GGML_OP_ADD &&
+                            !same_shape_bias &&
+                            bias_tensor &&
+                            bias_tensor->type == GGML_TYPE_F32 &&
+                            mm_node->type == GGML_TYPE_F32 &&
+                            bias_node->type == GGML_TYPE_F32 &&
+                            ggml_is_contiguous(bias_tensor) &&
+                            ggml_is_contiguous(bias_node) &&
+                            ggml_nelements(bias_tensor) == mm_node->ne[0] &&
+                            ggml_nelements(bias_node) == ggml_nelements(mm_node) &&
+                            !ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+
+                        if (bias_op == GGML_OP_ADD && !same_shape_bias && !row_bias) {
                             continue;
                         }
 
@@ -4093,6 +4126,50 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
                             fused_mul_mat_vec = true;
                             fused_node_count = 2;
+                            break;
+                        }
+
+                        if (row_bias && op == GGML_OP_MUL_MAT) {
+                            // GEMM into ADD (or GELU) buffer; bias (+ gelu)
+                            // fused into f16→f32 convert (or post-f32 epilogue).
+                            ggml_tensor * out_node = bias_node;
+                            bool with_gelu = false;
+                            if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY }) &&
+                                ggml_get_unary_op(cgraph->nodes[i + 2]) == GGML_UNARY_OP_GELU_ERF &&
+                                cgraph->nodes[i + 2]->src[0] == bias_node &&
+                                cgraph->nodes[i + 2]->type == GGML_TYPE_F32 &&
+                                ggml_is_contiguous(cgraph->nodes[i + 2])) {
+                                out_node = cgraph->nodes[i + 2];
+                                with_gelu = true;
+                            }
+
+                            ggml_tensor dst_shim = *mm_node;
+                            dst_shim.data   = out_node->data;
+                            dst_shim.buffer = out_node->buffer;
+                            dst_shim.nb[0]  = out_node->nb[0];
+                            dst_shim.nb[1]  = out_node->nb[1];
+                            dst_shim.nb[2]  = out_node->nb[2];
+                            dst_shim.nb[3]  = out_node->nb[3];
+                            cuda_ctx->mm_epilogue_bias = (const float *) bias_tensor->data;
+                            cuda_ctx->mm_epilogue_ne0  = mm_node->ne[0];
+                            cuda_ctx->mm_epilogue_gelu = with_gelu;
+                            ggml_cuda_mul_mat(*cuda_ctx, src0, src1, &dst_shim);
+                            // Fallback if cublas path did not consume epilogue
+                            // (e.g. mmq / non-fp16 weight path).
+                            if (cuda_ctx->mm_epilogue_bias) {
+                                ggml_cuda_op_mm_row_bias(
+                                        *cuda_ctx,
+                                        (float *) out_node->data,
+                                        cuda_ctx->mm_epilogue_bias,
+                                        cuda_ctx->mm_epilogue_ne0,
+                                        ggml_nelements(out_node),
+                                        cuda_ctx->mm_epilogue_gelu);
+                                cuda_ctx->mm_epilogue_bias = nullptr;
+                                cuda_ctx->mm_epilogue_ne0  = 0;
+                                cuda_ctx->mm_epilogue_gelu = false;
+                            }
+                            fused_mul_mat_vec = true;
+                            fused_node_count = with_gelu ? 3 : 2;
                             break;
                         }
                     }

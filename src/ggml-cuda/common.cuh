@@ -1434,6 +1434,12 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // Optional row-bias (+ gelu) epilogue for the next mul_mat cublas path.
+    // Set by graph fusion; consumed+cleared inside ggml_cuda_op_mul_mat_cublas.
+    const float * mm_epilogue_bias = nullptr;
+    int64_t       mm_epilogue_ne0  = 0;
+    bool          mm_epilogue_gelu = false;
 };
 
 struct ggml_cuda_mm_fusion_args_host {
