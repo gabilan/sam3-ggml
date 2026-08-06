@@ -9434,6 +9434,10 @@ kernel void kernel_diag_f32(
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+// Fused row-bias (+ gelu_erf) epilogue: dst = (mm + bias[i0]) [gelu].
+// Routes the write-out through the threadgroup staging path.
+constant bool FC_mul_mm_bias [[function_constant(FC_MUL_MM + 2)]];
+constant bool FC_mul_mm_gelu [[function_constant(FC_MUL_MM + 3)]];
 
 // each block_q contains 16*nl weights
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
@@ -9442,6 +9446,7 @@ kernel void kernel_mul_mm(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const char * bias,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -9687,7 +9692,7 @@ kernel void kernel_mul_mm(
 #endif
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (!FC_mul_mm_bias && (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1))) {
         // if no bounds checks on the output are needed, we can directly write to device memory
 #ifdef GGML_METAL_HAS_TENSOR
         device float * C = (device float *) dst +
@@ -9722,7 +9727,24 @@ kernel void kernel_mul_mm(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sgitg == 0) {
+        if (FC_mul_mm_bias) {
+            // Fused epilogue: all threads apply row bias (+ gelu_erf) while
+            // draining the staged tile. Same math as kernel_unary gelu_erf.
+            threadgroup const float * stage = (threadgroup const float *) shmem;
+            device const float * bv = (device const float *) bias + r0;
+            device float * D = (device float *) dst + im*args.ne1*args.ne0;
+
+            for (int t = tiitg; t < (int) nr0*nr1; t += 128) {
+                const short i = t % nr0;
+                const short j = t / nr0;
+
+                float v = stage[j*NR0 + i] + bv[i];
+                if (FC_mul_mm_gelu) {
+                    v = 0.5f*v*(1.0f + erf_approx<float>(v*SQRT_2_INV));
+                }
+                D[(r1 + j)*args.ne0 + r0 + i] = v;
+            }
+        } else if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;

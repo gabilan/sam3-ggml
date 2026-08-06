@@ -2224,7 +2224,55 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        // Fuse a following row-bias ADD (+ GELU_ERF) into the GEMM write-out,
+        // e.g. ViT [C] bias broadcast on [C, W*H*B] (see sam3_linear_spatial).
+        // Deletes the separate ADD (and UNARY) full-tensor read+write passes.
+        ggml_tensor * bias_vec = nullptr;
+        ggml_tensor * out_node = op;
+        int n_fuse_mm = 1;
+
+        if (ctx->use_fusion && op->type == GGML_TYPE_F32) {
+            const ggml_op ops_seq[3] = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY };
+            if (ctx->can_fuse(idx, ops_seq, 2)) {
+                ggml_tensor * add = ctx->node(idx + 1);
+                ggml_tensor * b = add->src[0] == op ? add->src[1] :
+                                  add->src[1] == op ? add->src[0] : nullptr;
+                if (b && b->type == GGML_TYPE_F32 && ggml_is_contiguous(b) &&
+                    ggml_nelements(b) == ne0 &&
+                    add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                    ggml_are_same_shape(op, add)) {
+                    bias_vec = b;
+                    out_node = add;
+                    n_fuse_mm = 2;
+
+                    if (ctx->can_fuse(idx, ops_seq, 3)) {
+                        ggml_tensor * un = ctx->node(idx + 2);
+                        if (ggml_get_unary_op(un) == GGML_UNARY_OP_GELU_ERF &&
+                            un->src[0] == add &&
+                            un->type == GGML_TYPE_F32 && ggml_is_contiguous(un) &&
+                            ggml_are_same_shape(add, un)) {
+                            out_node = un;
+                            n_fuse_mm = 3;
+                        }
+                    }
+
+                    if (ctx->debug_fusion > 0) {
+                        GGML_LOG_DEBUG("%s: fuse MUL_MAT+BIAS%s\n", __func__, n_fuse_mm == 3 ? "+GELU_ERF" : "");
+                    }
+                }
+            }
+        }
+
+        if (n_fuse_mm > 1) {
+            for (int i = 1; i < n_fuse_mm; ++i) {
+                if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                    break;
+                }
+            }
+        }
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op, bias_vec != nullptr, n_fuse_mm == 3);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -2247,12 +2295,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(out_node),   3);
+        if (bias_vec) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias_vec), 4);
+        }
 
         const size_t smem = pipeline.smem;
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31)/32), ((ne01 + 63)/64), ne12*ne13, 128, 1, 1);
+
+        return n_fuse_mm;
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 

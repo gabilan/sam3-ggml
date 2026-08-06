@@ -668,7 +668,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op, bool bias, bool gelu) {
     char base[256];
     char name[256];
 
@@ -679,7 +679,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
+    snprintf(name, 256, "%s_bci=%d_bco=%d_bias=%d_gelu=%d", base, bc_inp, bc_out, bias, gelu);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -687,14 +687,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
         ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+        ggml_metal_cv_set_bool(cv, bias,   FC_MUL_MM + 2);
+        ggml_metal_cv_set_bool(cv, gelu,   FC_MUL_MM + 3);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    // when the output size is not multiple of 64x32, we need extra smem to prevent out-of-bounds writes
-    res.smem = bc_out ? 8192 : 4096 + 2048;
+    // when the output size is not multiple of 64x32, we need extra smem to prevent out-of-bounds writes;
+    // the fused bias epilogue stages the full 64x32 f32 tile in shmem as well
+    res.smem = (bc_out || bias) ? 8192 : 4096 + 2048;
 
     return res;
 }
