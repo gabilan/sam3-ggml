@@ -3984,7 +3984,10 @@ int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
     const int32_t OC = op->ne[2];
     const int32_t ON = op->ne[3];
 
-    GGML_ASSERT(ON == 1);
+    // Kernels index one NCHW plane (C×H×W packed). Mux propagate can set ON>1
+    // (EWI-717); loop host-side over N via buffer offsets (CUDA already batches).
+    GGML_ASSERT(ON >= 1);
+    GGML_ASSERT(op->src[1]->ne[3] == ON);
 
     // SAM3 SimpleFPN: ConvT k2s2 + broadcast bias (+ optional gelu_erf).
     // Search the full encoder node list (neck scales share vit `x` and often
@@ -4028,7 +4031,8 @@ int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
             ggml_tensor * fuse_dst = gelu ? gelu : add;
             if (fuse_dst && ggml_is_contiguous(fuse_dst) &&
                 fuse_dst->type == GGML_TYPE_F32 &&
-                fuse_dst->ne[0] == OW && fuse_dst->ne[1] == OH && fuse_dst->ne[2] == OC) {
+                fuse_dst->ne[0] == OW && fuse_dst->ne[1] == OH && fuse_dst->ne[2] == OC &&
+                (int32_t) fuse_dst->ne[3] == ON) {
                 ggml_metal_kargs_conv_transpose_2d_k2s2_fused fargs = {
                     /*.IC         =*/ IC,
                     /*.IH         =*/ IH,
@@ -4045,16 +4049,27 @@ int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
 
                 auto pipeline = ggml_metal_library_get_pipeline_conv_transpose_2d_k2s2_fused(
                         lib, op->src[0], gelu != nullptr);
-                ggml_metal_encoder_set_pipeline(enc, pipeline);
-                ggml_metal_encoder_set_bytes (enc, &fargs, sizeof(fargs), 0);
-                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias_vec),   3);
-                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(fuse_dst),   4);
+
+                ggml_metal_buffer_id bid_w = ggml_metal_get_buffer_id(op->src[0]);
+                ggml_metal_buffer_id bid_x = ggml_metal_get_buffer_id(op->src[1]);
+                ggml_metal_buffer_id bid_b = ggml_metal_get_buffer_id(bias_vec);
+                ggml_metal_buffer_id bid_y = ggml_metal_get_buffer_id(fuse_dst);
+                const size_t x_base = bid_x.offs;
+                const size_t y_base = bid_y.offs;
 
                 constexpr int32_t nth = 128;
                 const int32_t total = OW * OH * OC;
-                ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
+                for (int32_t n = 0; n < ON; ++n) {
+                    bid_x.offs = x_base + (size_t) n * (size_t) nb13;
+                    bid_y.offs = y_base + (size_t) n * (size_t) fuse_dst->nb[3];
+                    ggml_metal_encoder_set_pipeline(enc, pipeline);
+                    ggml_metal_encoder_set_bytes (enc, &fargs, sizeof(fargs), 0);
+                    ggml_metal_encoder_set_buffer(enc, bid_w, 1);
+                    ggml_metal_encoder_set_buffer(enc, bid_x, 2);
+                    ggml_metal_encoder_set_buffer(enc, bid_b, 3);
+                    ggml_metal_encoder_set_buffer(enc, bid_y, 4);
+                    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
+                }
 
                 ctx->fused_skip.insert(add);
                 if (gelu) {
@@ -4066,7 +4081,7 @@ int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_op_concurrency_reset(ctx);
                 }
                 if (ctx->debug_fusion > 0) {
-                    GGML_LOG_DEBUG("%s: fuse CONV_T+BIAS%s\n", __func__, gelu ? "+GELU_ERF" : "");
+                    GGML_LOG_DEBUG("%s: fuse CONV_T+BIAS%s (ON=%d)\n", __func__, gelu ? "+GELU_ERF" : "", ON);
                 }
                 return 1;
             }
@@ -4091,16 +4106,25 @@ int ggml_metal_op_conv_transpose_2d(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_conv_transpose_2d(lib, op);
 
-    ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+    ggml_metal_buffer_id bid_w = ggml_metal_get_buffer_id(op->src[0]);
+    ggml_metal_buffer_id bid_x = ggml_metal_get_buffer_id(op->src[1]);
+    ggml_metal_buffer_id bid_y = ggml_metal_get_buffer_id(op);
+    const size_t x_base = bid_x.offs;
+    const size_t y_base = bid_y.offs;
 
     constexpr int32_t nth = 128;
     const int32_t total = OW * OH * OC;
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
+    for (int32_t n = 0; n < ON; ++n) {
+        bid_x.offs = x_base + (size_t) n * (size_t) nb13;
+        bid_y.offs = y_base + (size_t) n * (size_t) nb3;
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_w, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_x, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_y, 3);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (total + nth - 1) / nth, 1, 1, nth, 1, 1);
+    }
 
     return 1;
 }
