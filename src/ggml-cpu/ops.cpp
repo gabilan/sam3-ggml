@@ -6948,10 +6948,37 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
 
     const int32_t stride = ggml_get_op_params_i32(dst, 0);
 
-    // SAM3 SimpleFPN k2s2 fast path: skip full-tensor wdata permutes. Gather a
-    // Cin column per tap and reuse ggml_vec_dot_* so results stay bit-compatible
-    // with the legacy permute+dot path (and with Metal's k2s2 kernel).
-    if (ne00 == 2 && ne01 == 2 && stride == 2 &&
+    // SAM3 SimpleFPN k2s2 path: skips the full-tensor wdata permutes by
+    // gathering a Cin column per tap, reusing ggml_vec_dot_* so results stay
+    // bit-compatible with the legacy permute+dot path (and with Metal's k2s2
+    // kernel).
+    //
+    // EWI-1741, measured on x86-64 (EPYC 7R32, 4 threads, SAM 3.1 multiplex
+    // image encode): on the SimpleFPN shapes it was written for this is a large
+    // PESSIMISATION, because both gathers sit inside the wrong loops. `wcol`
+    // depends only on (n, oc, kh, kw, ic) but is re-gathered for every output
+    // pixel; `xcol` depends only on (n, iy, ix, ic) but is re-gathered for every
+    // output channel. On the [144,144,512] deconv (IC=1024, IH=IW=72) that is
+    // 512 * 5184 * 1024 * 5 ~= 1.4e10 strided scalar loads to feed 1.1e10
+    // useful MACs. The generic path below permutes once into wdata and then runs
+    // the same ggml_vec_dot_* over CONTIGUOUS operands.
+    //
+    // Output is bit-identical between the two: the dot products see identical
+    // operands in identical order, dst is memset to 0 first, and at k=2/s=2 each
+    // tap writes a distinct element, so the generic `+=` is exactly this `=`.
+    //
+    // Default is therefore the generic path. Set GGML_CT2D_K2S2_FAST=1 to get
+    // this one back — retained so the A/B stays reproducible in one process
+    // image, and because it may still win where the output-channel count is
+    // small enough that the redundant re-gather does not dominate.
+    // ne3 > 1 keeps the k2s2 path unconditionally: the generic path below
+    // indexes dst by i2 only and permutes src1 over ne12 alone, so it has
+    // never handled a batch, whereas this one does. Nothing in SAM 3.1 hits
+    // that (every deconv here is ne3 == 1), but it must not silently break.
+    const char * ct2d_k2s2_env = getenv("GGML_CT2D_K2S2_FAST");
+    const bool   ct2d_k2s2_fast = (ct2d_k2s2_env && ct2d_k2s2_env[0] == '1') || ne3 > 1;
+    if (ct2d_k2s2_fast &&
+        ne00 == 2 && ne01 == 2 && stride == 2 &&
         ne0 == ne10 * 2 && ne1 == ne11 * 2 &&
         ne12 == ne03 && ne3 == ne13 &&
         ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
