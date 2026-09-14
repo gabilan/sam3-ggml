@@ -36,6 +36,11 @@ struct fattn_mma_config {
     }                                                                                                                                                              \
 
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_ampere(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32,  8, 128, 2, 128,  16,  16,  16, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32, 16, 128, 2,  64,  16,  16,  16, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32, 32, 128, 2,  64,  16,  16,  16, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE( 32,  32, 64, 128, 2,  64,  16,  16,  16, 2, true);
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2, 128,  32,  32,  32, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 2, true);
@@ -1571,7 +1576,9 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 > 32 || ncols1*ncols2 < 16 || DKQ > 128 || ncols2 == 1) {
+    // EWI-1741: DKQ=32 config rows exist for NVIDIA only and are untested on
+    // RDNA. `DKQ > 128` alone would now ADMIT 32. Exclude below 64.
+    if (ncols1*ncols2 > 32 || ncols1*ncols2 < 16 || DKQ < 64 || DKQ > 128 || ncols2 == 1) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1786,6 +1793,11 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 4,  4); \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 8,  8); \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/16, 16); \
+
+DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,   8)
+DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,  16)
+DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,  32)
+DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 32,  32,  64)
 
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 64,  64,   8)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 80,  80,   8)
