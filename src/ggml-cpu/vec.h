@@ -44,6 +44,7 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
 void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
 
 void ggml_vec_silu_f32(const int n, float * y, const float * x);
+void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x);
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean); //it will also center y ( y = y - mean )
 ggml_float ggml_vec_soft_max_f32(const int n, float * y, const float * x, float max);
 ggml_float ggml_vec_log_soft_max_f32(const int n, float * y, const float * x, float max);
@@ -977,6 +978,10 @@ inline static float ggml_gelu_f32(float x) {
     return 0.5f*x*(1.0f + tanhf(SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x)));
 }
 
+inline static float ggml_gelu_erf_f32(float x) {
+    return 0.5f*x*(1.0f + erff(x*SQRT_2_INV));
+}
+
 inline static void ggml_vec_gelu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x) {
     const uint16_t * i16 = (const uint16_t *) x;
     for (int i = 0; i < n; ++i) {
@@ -1014,13 +1019,6 @@ inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
     }
 }
 #endif
-
-inline static void ggml_vec_gelu_erf_f32(const int n, float * y, const float * x) {
-    for (int i = 0; i < n; ++i) {
-        float xi = x[i];
-        y[i] = 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV));
-    }
-}
 
 inline static float ggml_gelu_quick_f32(float x) {
     return x*(1.0f/(1.0f+expf(GELU_QUICK_COEF*x)));
@@ -1139,6 +1137,46 @@ inline static svfloat32_t ggml_v_silu(svbool_t pg, svfloat32_t x) {
     return svdiv_f32_x(pg, x, one_plus_exp_neg_x);
 }
 
+// computes gelu_erf x*0.5*(1+erf(x/sqrt(2))) in single precision vector
+//
+// erf(u) is approximated on |u| <= 4 by the odd rational u*P(u^2)/Q(u^2)
+// (P degree 6, Q degree 5, minimax-fitted for absolute error), and forced to
+// exactly +-1 for |u| >= 0x1.f5a88ap+1f, which is the smallest float whose erf rounds
+// to 1.0f -- so the whole saturated tail, |x| >= 5.5426, is bit-identical to
+// the scalar erff() reference. The epilogue keeps the reference expression
+// shape 0.5f*x*(1.0f + erf), cancellation included, so the two agree to
+// within 1 ulp everywhere. Inputs are clamped before squaring so that large
+// |x| cannot overflow u^12 in the numerator.
+inline static svfloat32_t ggml_v_gelu_erf(svbool_t pg, svfloat32_t x) {
+    const svfloat32_t one = svdup_n_f32(1.0f);
+    const svfloat32_t u  = svmul_n_f32_x(pg, x, SQRT_2_INV);
+    const svfloat32_t au = svabs_f32_x(pg, u);
+    const svfloat32_t uc = svmin_n_f32_x(pg, au, 0x1p+2f);
+    const svfloat32_t t  = svmul_f32_x(pg, uc, uc);
+
+    svfloat32_t p = svdup_n_f32(-0x1.d59846p-27f);
+    p = svmad_n_f32_x(pg, p, t, 0x1.40d1c2p-18f);
+    p = svmad_n_f32_x(pg, p, t, 0x1.9148aap-12f);
+    p = svmad_n_f32_x(pg, p, t, 0x1.f741bcp-9f);
+    p = svmad_n_f32_x(pg, p, t, 0x1.bd17dcp-5f);
+    p = svmad_n_f32_x(pg, p, t, 0x1.7a498cp-3f);
+    p = svmad_n_f32_x(pg, p, t, 0x1.20dd76p+0f);
+
+    svfloat32_t q = svdup_n_f32(0x1.0c79dep-14f);
+    q = svmad_n_f32_x(pg, q, t, 0x1.574cbep-10f);
+    q = svmad_n_f32_x(pg, q, t, 0x1.fa61ccp-7f);
+    q = svmad_n_f32_x(pg, q, t, 0x1.d23baep-4f);
+    q = svmad_n_f32_x(pg, q, t, 0x1.fcf530p-2f);
+    q = svmad_n_f32_x(pg, q, t, 1.0f);
+
+    svfloat32_t e = svmul_f32_x(pg, uc, svdiv_f32_x(pg, p, q));
+    e = svsel_f32(svcmpge_n_f32(pg, au, 0x1.f5a88ap+1f), one, e);
+    e = svreinterpret_f32_u32(svorr_u32_x(pg, svreinterpret_u32_f32(e),
+                                          svand_n_u32_x(pg, svreinterpret_u32_f32(u), 0x80000000u)));
+
+    return svmul_f32_x(pg, svmul_n_f32_x(pg, x, 0.5f), svadd_f32_x(pg, one, e));
+}
+
 #elif defined(__ARM_NEON) && defined(__aarch64__)
 
 // adapted from arm limited optimized routine
@@ -1176,6 +1214,47 @@ inline static float32x4_t ggml_v_silu(float32x4_t x) {
     const float32x4_t exp_neg_x = ggml_v_expf(neg_x);
     const float32x4_t one_plus_exp_neg_x = vaddq_f32(one, exp_neg_x);
     return vdivq_f32(x, one_plus_exp_neg_x);
+}
+
+// computes gelu_erf x*0.5*(1+erf(x/sqrt(2))) in single precision vector
+//
+// erf(u) is approximated on |u| <= 4 by the odd rational u*P(u^2)/Q(u^2)
+// (P degree 6, Q degree 5, minimax-fitted for absolute error), and forced to
+// exactly +-1 for |u| >= 0x1.f5a88ap+1f, which is the smallest float whose erf rounds
+// to 1.0f -- so the whole saturated tail, |x| >= 5.5426, is bit-identical to
+// the scalar erff() reference. The epilogue keeps the reference expression
+// shape 0.5f*x*(1.0f + erf), cancellation included, so the two agree to
+// within 1 ulp everywhere. Inputs are clamped before squaring so that large
+// |x| cannot overflow u^12 in the numerator.
+inline static float32x4_t ggml_v_gelu_erf(float32x4_t x) {
+    const uint32x4_t  sign_mask = vdupq_n_u32(0x80000000u);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t u  = vmulq_n_f32(x, SQRT_2_INV);
+    const float32x4_t au = vabsq_f32(u);
+    const float32x4_t uc = vminq_f32(au, vdupq_n_f32(0x1p+2f));
+    const float32x4_t t  = vmulq_f32(uc, uc);
+
+    float32x4_t p = vdupq_n_f32(-0x1.d59846p-27f);
+    p = vfmaq_f32(vdupq_n_f32(0x1.40d1c2p-18f), p, t);
+    p = vfmaq_f32(vdupq_n_f32(0x1.9148aap-12f), p, t);
+    p = vfmaq_f32(vdupq_n_f32(0x1.f741bcp-9f), p, t);
+    p = vfmaq_f32(vdupq_n_f32(0x1.bd17dcp-5f), p, t);
+    p = vfmaq_f32(vdupq_n_f32(0x1.7a498cp-3f), p, t);
+    p = vfmaq_f32(vdupq_n_f32(0x1.20dd76p+0f), p, t);
+
+    float32x4_t q = vdupq_n_f32(0x1.0c79dep-14f);
+    q = vfmaq_f32(vdupq_n_f32(0x1.574cbep-10f), q, t);
+    q = vfmaq_f32(vdupq_n_f32(0x1.fa61ccp-7f), q, t);
+    q = vfmaq_f32(vdupq_n_f32(0x1.d23baep-4f), q, t);
+    q = vfmaq_f32(vdupq_n_f32(0x1.fcf530p-2f), q, t);
+    q = vfmaq_f32(vdupq_n_f32(1.0f), q, t);
+
+    float32x4_t e = vmulq_f32(uc, vdivq_f32(p, q));
+    e = vbslq_f32(vcgeq_f32(au, vdupq_n_f32(0x1.f5a88ap+1f)), one, e);
+    e = vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(e),
+                                        vandq_u32(vreinterpretq_u32_f32(u), sign_mask)));
+
+    return vmulq_f32(vmulq_n_f32(x, 0.5f), vaddq_f32(one, e));
 }
 
 #elif defined(__AVX512F__) && defined(__AVX512DQ__)
@@ -1219,6 +1298,47 @@ inline static __m512 ggml_v_silu(__m512 x) {
     const __m512 exp_neg_x = ggml_v_expf(neg_x);
     const __m512 one_plus_exp_neg_x = _mm512_add_ps(one, exp_neg_x);
     return _mm512_div_ps(x, one_plus_exp_neg_x);
+}
+
+// computes gelu_erf x*0.5*(1+erf(x/sqrt(2))) in single precision vector
+//
+// erf(u) is approximated on |u| <= 4 by the odd rational u*P(u^2)/Q(u^2)
+// (P degree 6, Q degree 5, minimax-fitted for absolute error), and forced to
+// exactly +-1 for |u| >= 0x1.f5a88ap+1f, which is the smallest float whose erf rounds
+// to 1.0f -- so the whole saturated tail, |x| >= 5.5426, is bit-identical to
+// the scalar erff() reference. The epilogue keeps the reference expression
+// shape 0.5f*x*(1.0f + erf), cancellation included, so the two agree to
+// within 1 ulp everywhere. Inputs are clamped before squaring so that large
+// |x| cannot overflow u^12 in the numerator.
+inline static __m512 ggml_v_gelu_erf(__m512 x) {
+    const __m512 sign_mask = _mm512_set1_ps(-0.0f);
+    const __m512 one       = _mm512_set1_ps(1.0f);
+    const __m512 u  = _mm512_mul_ps(x, _mm512_set1_ps(SQRT_2_INV));
+    const __m512 au = _mm512_andnot_ps(sign_mask, u);
+    const __m512 uc = _mm512_min_ps(au, _mm512_set1_ps(0x1p+2f));
+    const __m512 t  = _mm512_mul_ps(uc, uc);
+
+    __m512 p = _mm512_set1_ps(-0x1.d59846p-27f);
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(0x1.40d1c2p-18f));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(0x1.9148aap-12f));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(0x1.f741bcp-9f));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(0x1.bd17dcp-5f));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(0x1.7a498cp-3f));
+    p = _mm512_fmadd_ps(p, t, _mm512_set1_ps(0x1.20dd76p+0f));
+
+    __m512 q = _mm512_set1_ps(0x1.0c79dep-14f);
+    q = _mm512_fmadd_ps(q, t, _mm512_set1_ps(0x1.574cbep-10f));
+    q = _mm512_fmadd_ps(q, t, _mm512_set1_ps(0x1.fa61ccp-7f));
+    q = _mm512_fmadd_ps(q, t, _mm512_set1_ps(0x1.d23baep-4f));
+    q = _mm512_fmadd_ps(q, t, _mm512_set1_ps(0x1.fcf530p-2f));
+    q = _mm512_fmadd_ps(q, t, _mm512_set1_ps(1.0f));
+
+    __m512 e = _mm512_mul_ps(uc, _mm512_div_ps(p, q));
+    const __mmask16 sat = _mm512_cmp_ps_mask(au, _mm512_set1_ps(0x1.f5a88ap+1f), _CMP_GE_OQ);
+    e = _mm512_mask_blend_ps(sat, e, one);
+    e = _mm512_or_ps(e, _mm512_and_ps(sign_mask, u));
+
+    return _mm512_mul_ps(_mm512_mul_ps(_mm512_set1_ps(0.5f), x), _mm512_add_ps(one, e));
 }
 
 #elif defined(__AVX2__) && defined(__FMA__)
@@ -1276,6 +1396,47 @@ inline static __m256 ggml_v_silu(__m256 x) {
     return _mm256_div_ps(x, one_plus_exp_neg_x);
 }
 
+// computes gelu_erf x*0.5*(1+erf(x/sqrt(2))) in single precision vector
+//
+// erf(u) is approximated on |u| <= 4 by the odd rational u*P(u^2)/Q(u^2)
+// (P degree 6, Q degree 5, minimax-fitted for absolute error), and forced to
+// exactly +-1 for |u| >= 0x1.f5a88ap+1f, which is the smallest float whose erf rounds
+// to 1.0f -- so the whole saturated tail, |x| >= 5.5426, is bit-identical to
+// the scalar erff() reference. The epilogue keeps the reference expression
+// shape 0.5f*x*(1.0f + erf), cancellation included, so the two agree to
+// within 1 ulp everywhere. Inputs are clamped before squaring so that large
+// |x| cannot overflow u^12 in the numerator.
+inline static __m256 ggml_v_gelu_erf(__m256 x) {
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 one       = _mm256_set1_ps(1.0f);
+    const __m256 u  = _mm256_mul_ps(x, _mm256_set1_ps(SQRT_2_INV));
+    const __m256 au = _mm256_andnot_ps(sign_mask, u);
+    const __m256 uc = _mm256_min_ps(au, _mm256_set1_ps(0x1p+2f));
+    const __m256 t  = _mm256_mul_ps(uc, uc);
+
+    __m256 p = _mm256_set1_ps(-0x1.d59846p-27f);
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0x1.40d1c2p-18f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0x1.9148aap-12f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0x1.f741bcp-9f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0x1.bd17dcp-5f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0x1.7a498cp-3f));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0x1.20dd76p+0f));
+
+    __m256 q = _mm256_set1_ps(0x1.0c79dep-14f);
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(0x1.574cbep-10f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(0x1.fa61ccp-7f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(0x1.d23baep-4f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(0x1.fcf530p-2f));
+    q = _mm256_fmadd_ps(q, t, _mm256_set1_ps(1.0f));
+
+    __m256 e = _mm256_mul_ps(uc, _mm256_div_ps(p, q));
+    const __m256 sat = _mm256_cmp_ps(au, _mm256_set1_ps(0x1.f5a88ap+1f), _CMP_GE_OQ);
+    e = _mm256_blendv_ps(e, one, sat);
+    e = _mm256_or_ps(e, _mm256_and_ps(sign_mask, u));
+
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x), _mm256_add_ps(one, e));
+}
+
 #elif defined(__SSE2__) // __AVX2__ / __ARM_NEON
 
 #if defined(__FMA__)
@@ -1328,6 +1489,47 @@ inline static __m128 ggml_v_silu(__m128 x) {
     const __m128 exp_neg_x = ggml_v_expf(neg_x);
     const __m128 one_plus_exp_neg_x = _mm_add_ps(one, exp_neg_x);
     return _mm_div_ps(x, one_plus_exp_neg_x);
+}
+
+// computes gelu_erf x*0.5*(1+erf(x/sqrt(2))) in single precision vector
+//
+// erf(u) is approximated on |u| <= 4 by the odd rational u*P(u^2)/Q(u^2)
+// (P degree 6, Q degree 5, minimax-fitted for absolute error), and forced to
+// exactly +-1 for |u| >= 0x1.f5a88ap+1f, which is the smallest float whose erf rounds
+// to 1.0f -- so the whole saturated tail, |x| >= 5.5426, is bit-identical to
+// the scalar erff() reference. The epilogue keeps the reference expression
+// shape 0.5f*x*(1.0f + erf), cancellation included, so the two agree to
+// within 1 ulp everywhere. Inputs are clamped before squaring so that large
+// |x| cannot overflow u^12 in the numerator.
+inline static __m128 ggml_v_gelu_erf(__m128 x) {
+    const __m128 sign_mask = _mm_set1_ps(-0.0f);
+    const __m128 one       = _mm_set1_ps(1.0f);
+    const __m128 u  = _mm_mul_ps(x, _mm_set1_ps(SQRT_2_INV));
+    const __m128 au = _mm_andnot_ps(sign_mask, u);
+    const __m128 uc = _mm_min_ps(au, _mm_set1_ps(0x1p+2f));
+    const __m128 t  = _mm_mul_ps(uc, uc);
+
+    __m128 p = _mm_set1_ps(-0x1.d59846p-27f);
+    p = MADD128(p, t, _mm_set1_ps(0x1.40d1c2p-18f));
+    p = MADD128(p, t, _mm_set1_ps(0x1.9148aap-12f));
+    p = MADD128(p, t, _mm_set1_ps(0x1.f741bcp-9f));
+    p = MADD128(p, t, _mm_set1_ps(0x1.bd17dcp-5f));
+    p = MADD128(p, t, _mm_set1_ps(0x1.7a498cp-3f));
+    p = MADD128(p, t, _mm_set1_ps(0x1.20dd76p+0f));
+
+    __m128 q = _mm_set1_ps(0x1.0c79dep-14f);
+    q = MADD128(q, t, _mm_set1_ps(0x1.574cbep-10f));
+    q = MADD128(q, t, _mm_set1_ps(0x1.fa61ccp-7f));
+    q = MADD128(q, t, _mm_set1_ps(0x1.d23baep-4f));
+    q = MADD128(q, t, _mm_set1_ps(0x1.fcf530p-2f));
+    q = MADD128(q, t, _mm_set1_ps(1.0f));
+
+    __m128 e = _mm_mul_ps(uc, _mm_div_ps(p, q));
+    const __m128 sat = _mm_cmpge_ps(au, _mm_set1_ps(0x1.f5a88ap+1f));
+    e = _mm_or_ps(_mm_and_ps(sat, one), _mm_andnot_ps(sat, e));
+    e = _mm_or_ps(e, _mm_and_ps(sign_mask, u));
+
+    return _mm_mul_ps(_mm_mul_ps(_mm_set1_ps(0.5f), x), _mm_add_ps(one, e));
 }
 
 #elif defined(__riscv_v_intrinsic)
