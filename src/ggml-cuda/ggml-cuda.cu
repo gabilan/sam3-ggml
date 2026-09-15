@@ -1271,6 +1271,37 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+// ─── EWI-1963 fusion audit ───────────────────────────────────────────────────
+// The conv-transpose neck fusion already logs under SAM3_FUSION_LOG (see the
+// CONV_TRANSPOSE_2D block in ggml_cuda_graph_compute). The MUL_MAT(+ADD)(+GELU)
+// bias/gelu epilogue had no instrumentation at all, so a silent reject or a
+// silent fallback to a second kernel was indistinguishable from a hit. These
+// helpers close that gap. Host-side only: a branch and a counter per op, no
+// kernel changes, no extra syncs.
+static bool sam3_fusion_log_enabled() {
+    static const bool on = getenv("SAM3_FUSION_LOG") != nullptr;
+    return on;
+}
+
+// Graph-time counters for the MUL_MAT(+ADD)(+GELU) fusion pass. Capped logging
+// mirrors the existing conv-transpose path (48 hits / 16 misses).
+static int sam3_mm_accept_n = 0;
+static int sam3_mm_reject_n = 0;
+
+static void sam3_mm_epilogue_log(const char * what, int64_t rows, int64_t cols, bool gelu) {
+    static int n = 0;
+    if (!sam3_fusion_log_enabled()) {
+        return;
+    }
+    if (n < 40) {
+        fprintf(stderr, "sam3_fuse: mm epilogue %s rows=%lld cols=%lld gelu=%d\n",
+                what, (long long) rows, (long long) cols, (int) gelu);
+    } else if (n == 40) {
+        fprintf(stderr, "sam3_fuse: mm epilogue log cap reached (40 lines)\n");
+    }
+    n++;
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1376,6 +1407,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                         CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             if (ctx.mm_epilogue_bias && ctx.mm_epilogue_ne0 == row_diff && id == ctx.device) {
+                sam3_mm_epilogue_log("INLINE f32+bias", row_diff, src1_ncols, ctx.mm_epilogue_gelu);
                 ggml_cuda_op_mm_row_bias(ctx, dst_dd_i, ctx.mm_epilogue_bias,
                         ctx.mm_epilogue_ne0, row_diff * src1_ncols, ctx.mm_epilogue_gelu);
                 ctx.mm_epilogue_bias = nullptr;
@@ -1398,12 +1430,19 @@ static void ggml_cuda_op_mul_mat_cublas(
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 
             if (ctx.mm_epilogue_bias && ctx.mm_epilogue_ne0 == row_diff && id == ctx.device) {
+                sam3_mm_epilogue_log("INLINE f16->f32+bias", row_diff, src1_ncols, ctx.mm_epilogue_gelu);
                 ggml_cuda_op_mm_f16_to_f32_bias(ctx, dst_f16.get(), dst_dd_i, ctx.mm_epilogue_bias,
                         ctx.mm_epilogue_ne0, row_diff * src1_ncols, ctx.mm_epilogue_gelu);
                 ctx.mm_epilogue_bias = nullptr;
                 ctx.mm_epilogue_ne0  = 0;
                 ctx.mm_epilogue_gelu = false;
             } else {
+                if (ctx.mm_epilogue_bias) {
+                    // set by the fusion pass but this path cannot consume it:
+                    // a second kernel will be launched by the caller instead.
+                    sam3_mm_epilogue_log("MISMATCH f16->f32 (extra kernel)", row_diff, src1_ncols,
+                                         ctx.mm_epilogue_gelu);
+                }
                 const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
                 to_fp32_cuda(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
             }
@@ -4162,6 +4201,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
                         if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
+                            if (sam3_fusion_log_enabled() && cgraph->nodes[i]->op == op &&
+                                sam3_mm_reject_n < 16) {
+                                fprintf(stderr,
+                                    "sam3_fuse: mm reject i=%d op=%s reason=no_fusible_%s_successor next=%s\n",
+                                    i, ggml_op_name(op),
+                                    bias_op == GGML_OP_ADD ? "ADD" : "ADD_ID",
+                                    i + 1 < cgraph->n_nodes ? ggml_op_name(cgraph->nodes[i + 1]->op) : "EOF");
+                                sam3_mm_reject_n++;
+                            }
                             continue;
                         }
 
@@ -4210,6 +4258,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             !ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
                         if (bias_op == GGML_OP_ADD && !same_shape_bias && !row_bias) {
+                            if (sam3_fusion_log_enabled() && sam3_mm_reject_n < 16) {
+                                const char * why = "?";
+                                if (!bias_tensor)                                        why = "bias_operand_null";
+                                else if (bias_tensor->type != GGML_TYPE_F32)             why = "bias_not_f32";
+                                else if (mm_node->type != GGML_TYPE_F32)                 why = "mul_mat_out_not_f32";
+                                else if (bias_node->type != GGML_TYPE_F32)               why = "add_out_not_f32";
+                                else if (!ggml_is_contiguous(bias_tensor))               why = "bias_noncontig";
+                                else if (!ggml_is_contiguous(bias_node))                 why = "add_noncontig";
+                                else if (ggml_nelements(bias_tensor) != mm_node->ne[0])  why = "bias_ne!=mm_ne0";
+                                else if (ggml_nelements(bias_node) != ggml_nelements(mm_node)) why = "add_ne!=mm_ne";
+                                else if (ggml_backend_buft_is_cuda_split(src0->buffer->buft))  why = "split_buffer";
+                                fprintf(stderr,
+                                    "sam3_fuse: mm reject i=%d reason=not_row_bias:%s k=%lldx%lld n=%lld bias_n=%lld bias_type=%s same_shape=%d\n",
+                                    i, why,
+                                    (long long) mm_node->src[0]->ne[0], (long long) mm_node->src[0]->ne[1],
+                                    (long long) mm_node->src[1]->ne[1],
+                                    (long long) ggml_nelements(bias_tensor),
+                                    ggml_type_name(bias_tensor->type), (int) same_shape_bias);
+                                sam3_mm_reject_n++;
+                            }
                             continue;
                         }
 
@@ -4217,6 +4285,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         fusion_data.x_bias = bias_tensor;
 
                         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+                            sam3_mm_accept_n++;
+                            sam3_mm_epilogue_log("HIT vec_f (graph-time)", mm_node->ne[0], mm_node->src[1]->ne[1], false);
                             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
                             fused_mul_mat_vec = true;
                             fused_node_count = 2;
@@ -4258,6 +4328,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             // Fallback if cublas path did not consume epilogue
                             // (e.g. mmq / non-fp16 weight path).
                             if (cuda_ctx->mm_epilogue_bias) {
+                                sam3_mm_epilogue_log("CALLER-FALLBACK row_bias (extra kernel)",
+                                                     mm_node->ne[0], mm_node->src[1]->ne[1], with_gelu);
                                 ggml_cuda_op_mm_row_bias(
                                         *cuda_ctx,
                                         (float *) out_node->data,
@@ -4271,6 +4343,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             }
                             fused_mul_mat_vec = true;
                             fused_node_count = with_gelu ? 3 : 2;
+                            if (sam3_fusion_log_enabled()) {
+                                if (sam3_mm_accept_n < 48) {
+                                    fprintf(stderr,
+                                        "sam3_fuse: mm hit row_bias%s i=%d k=%lldx%lld n=%lld bias_n=%lld\n",
+                                        with_gelu ? "+GELU_ERF" : "", i,
+                                        (long long) src0->ne[0], (long long) src0->ne[1],
+                                        (long long) src1->ne[1],
+                                        (long long) ggml_nelements(bias_tensor));
+                                } else if (sam3_mm_accept_n == 48) {
+                                    fprintf(stderr, "sam3_fuse: mm hit log cap reached (48 lines)\n");
+                                }
+                                sam3_mm_accept_n++;
+                            }
                             break;
                         }
                     }
