@@ -5249,7 +5249,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
-            return true;
+            // norm.cu's kernels are f32-only and every launcher asserts it
+            // (ggml_cuda_op_norm / _rms_norm / _l2_norm). Claiming unconditional
+            // support aborted in debug and mis-read a non-float buffer in release.
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
             break;
@@ -5290,9 +5293,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:
-            return true;
+            // diagmask.cu asserts f32 on both sides.
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
-            return true;
+            // softmax.cu asserts f32 on src0 and dst. src1 (the optional mask)
+            // is separately allowed to be f16 or f32 by that kernel.
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX_BACK: {
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
@@ -5312,8 +5318,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CONV_2D:
         case GGML_OP_CONV_2D_DW:
         case GGML_OP_CONV_TRANSPOSE_2D:
-        case GGML_OP_POOL_2D:
+            // NOT type-checked here: conv2d-transpose.cu accepts an F16 kernel
+            // (line 204 asserts kernel is F16||F32 while input/dst are F32), and
+            // src[0] IS the weights for this op -- an f32 check on src[0] would be
+            // wrong and would push SAM3's neck deconvs off the GPU.
             return true;
+        case GGML_OP_POOL_2D:
+            // pool2d.cu:71-72 asserts f32 on both sides.
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_ACC:
             // TODO: extend support like so:
             //return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]);
@@ -5332,7 +5344,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_PAD:
-            return true;
+            // pad.cu's pad_f32 is the only kernel and ggml_cuda_op_pad asserts
+            // f32 on src0 and dst. Correct check already existed two lines below,
+            // on GGML_OP_WIN_PART.
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
             return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -5362,8 +5377,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
-        case GGML_OP_SOLVE_TRI:
+            // NOT type-checked here: tri.cu:100 asserts only src0->type == dst->type
+            // (not f32), and diag.cu was not verified. Left as-is deliberately.
             return true;
+        case GGML_OP_SOLVE_TRI:
+            // solve_tri.cu's kernels take `const float *`; no other type path exists.
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
 
         default:
             return false;
