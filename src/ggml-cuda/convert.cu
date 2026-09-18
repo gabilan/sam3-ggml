@@ -693,8 +693,67 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
+// Vectorized contiguous converters (EWI-1963 f16-stream).
+//
+// `convert_unary_cont_cuda` below is the f32<->f16 path that every f16-weight
+// GEMM's src1 cast and every f16 weight upload runs through. The scalar kernel
+// it calls is one element per thread: 4 bytes read + 2 bytes written for the
+// f32->f16 direction, at ~840 GB/s measured against a ~1.8 TB/s device, because
+// each thread also pays the full 4-D index computation for a 6-byte payload.
+//
+// These kernels move 4x the payload per thread with the same index math. They
+// are bit-identical to the scalar path by construction: `__float22half2_rn` is
+// defined as the same round-to-nearest-even conversion as `__float2half_rn`
+// applied lane-for-lane, which is what `ggml_cuda_cast<half>(float)` resolves
+// to, and `__low2float`/`__high2float` are `__half2float` of that lane. The
+// tail is left to the scalar expression itself rather than reimplemented.
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_cont_vec4(const src_t * __restrict__ x, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i + 4 <= k) {
+        if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, half>) {
+            const float4 v = *reinterpret_cast<const float4 *>(x + i);
+            half2 * d = reinterpret_cast<half2 *>(y + i);
+            d[0] = __float22half2_rn(make_float2(v.x, v.y));
+            d[1] = __float22half2_rn(make_float2(v.z, v.w));
+        } else {
+            const half2 a0 = *reinterpret_cast<const half2 *>(x + i);
+            const half2 a1 = *reinterpret_cast<const half2 *>(x + i + 2);
+            float4 v;
+            v.x = __low2float (a0);
+            v.y = __high2float(a0);
+            v.z = __low2float (a1);
+            v.w = __high2float(a1);
+            *reinterpret_cast<float4 *>(y + i) = v;
+        }
+    } else {
+        for (int64_t j = i; j < k; ++j) {
+            y[j] = ggml_cuda_cast<dst_t>(x[j]);
+        }
+    }
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    if constexpr ((std::is_same_v<src_t, float> && std::is_same_v<dst_t, half>) ||
+                  (std::is_same_v<src_t, half>  && std::is_same_v<dst_t, float>)) {
+        // 16-byte source access and 4-byte destination stores (half2 pairs for
+        // the f32->f16 direction, float4 for the other). Both are CUDA
+        // allocations in every caller, so the fallback is a safety net for a
+        // sub-tensor view, not an expected path.
+        const uintptr_t a_src = reinterpret_cast<uintptr_t>(vx);
+        const uintptr_t a_dst = reinterpret_cast<uintptr_t>(y);
+        const bool aligned = (a_src % 16 == 0) && (a_dst % 4 == 0);
+        if (aligned && k >= 4) {
+            const int64_t nvec = (k + 3) / 4;
+            const int64_t nblk = (nvec + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+            if (nblk <= 0x7fffffffLL) {
+                convert_unary_cont_vec4<src_t, dst_t><<<(unsigned) nblk, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+                        (const src_t *) vx, y, k);
+                return;
+            }
+        }
+    }
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
