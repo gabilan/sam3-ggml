@@ -324,6 +324,135 @@ static void norm_f32_cuda(
     }
 }
 
+// ── EWI-1963 kernel sweep: vectorized fused layer-norm ──────────────────────
+//
+// The scalar norm_f32 above is one element per thread, and in every ViT call
+// this model makes blockDim.x == ncols == 1024: each thread loads exactly one
+// float, and then a full 1024-thread block reduction is paid for it. Measured
+// at ~840 GB/s against a ~1.8 TB/s device, i.e. 45% of the achievable rate for
+// its own access pattern.
+//
+// This kernel gives each thread VEC consecutive columns of one row. The whole
+// row then fits in registers across the reduction, so the row is read once and
+// written once; the reduction is over (ncols/VEC) threads instead of ncols; and
+// the per-element mul/add column indices become a straight vector load, since
+// the path is only taken when mul/add are at least as wide as the row (so the
+// fastmodulo the scalar kernel performs resolves to the column itself).
+//
+// NOT bit-identical to the scalar kernel: a per-thread partial sum is formed
+// from VEC=4 elements instead of one, so the summation order differs and the
+// mean and variance can move in the last ulps. It is taken only when
+// ncols % 4 == 0 and ncols <= 4*block_size (one vector per thread, so the row
+// segment stays in registers across the reduction).
+#define NORM_F32_VEC 4
+template <int block_size, bool do_multiply, bool do_add>
+static __global__ void norm_f32_vec(
+        const float * __restrict__ x,
+        float * __restrict__ dst,
+        const int     ncols,
+        const int64_t stride_row,
+        const int64_t stride_channel,
+        const int64_t stride_sample,
+        const float   eps,
+        const float * __restrict__ mul                  = nullptr,
+        const int64_t mul_stride_row                    = 0,
+        const int64_t mul_stride_channel                = 0,
+        const int64_t mul_stride_sample                 = 0,
+        const uint3   mul_nrows_packed                  = make_uint3(0, 0, 0),
+        const uint3   mul_nchannels_packed              = make_uint3(0, 0, 0),
+        const uint3   mul_nsamples_packed               = make_uint3(0, 0, 0),
+        const float * __restrict__ add                  = nullptr,
+        const int64_t add_stride_row                    = 0,
+        const int64_t add_stride_channel                = 0,
+        const int64_t add_stride_sample                 = 0,
+        const uint3   add_nrows_packed                  = make_uint3(0, 0, 0),
+        const uint3   add_nchannels_packed              = make_uint3(0, 0, 0),
+        const uint3   add_nsamples_packed               = make_uint3(0, 0, 0)) {
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+
+    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+
+    const int64_t base  = sample*stride_sample + channel*stride_channel + row*stride_row;
+    const int64_t dbase = ((int64_t) (sample*gridDim.y + channel)*gridDim.x + row)*ncols;
+    const int     col0  = threadIdx.x * NORM_F32_VEC;
+
+    const float * xp = x + base + col0;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const int add_row     = fastmodulo(row, add_nrows_packed);
+        const int add_channel = fastmodulo(channel, add_nchannels_packed);
+        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    // Load the row segment once and keep it: it is used again after the
+    // reduction, and re-reading it is what the scalar kernel does. 16-byte
+    // accesses are safe here: the dispatcher only takes this path when the
+    // base pointers are 16-byte aligned and every row stride is a multiple of
+    // four floats, so col0 (a multiple of four) keeps this address aligned.
+    //
+    // A thread whose whole vector lies past the row contributes zero rather
+    // than returning: the block reduction has every thread in it, so an early
+    // return would leave its warp's partial in shared memory unwritten. Adding
+    // 0.0f leaves the sum bit-for-bit what it was.
+    const bool active = col0 < ncols;
+
+    float4 xv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (active) {
+        xv = *reinterpret_cast<const float4 *>(xp);
+    }
+    const float v[NORM_F32_VEC] = { xv.x, xv.y, xv.z, xv.w };
+
+    float2 mean_var = make_float2(0.0f, 0.0f);
+#pragma unroll
+    for (int k = 0; k < NORM_F32_VEC; ++k) {
+        mean_var.x += v[k];
+        mean_var.y += v[k] * v[k];
+    }
+
+    extern __shared__ float2 s_sum2[];
+    mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
+
+    const float mean    = mean_var.x / ncols;
+    const float var     = mean_var.y / ncols - mean * mean;
+    const float inv_std = rsqrtf(var + eps);
+
+    if (!active) {
+        return;
+    }
+
+    float4 out;
+    if constexpr (do_multiply) {
+        const float4 mv = *reinterpret_cast<const float4 *>(mul + col0);
+        out.x = (v[0] - mean) * inv_std * mv.x;
+        out.y = (v[1] - mean) * inv_std * mv.y;
+        out.z = (v[2] - mean) * inv_std * mv.z;
+        out.w = (v[3] - mean) * inv_std * mv.w;
+    } else {
+        out.x = (v[0] - mean) * inv_std;
+        out.y = (v[1] - mean) * inv_std;
+        out.z = (v[2] - mean) * inv_std;
+        out.w = (v[3] - mean) * inv_std;
+    }
+    if constexpr (do_add) {
+        const float4 av = *reinterpret_cast<const float4 *>(add + col0);
+        out.x += av.x;
+        out.y += av.y;
+        out.z += av.z;
+        out.w += av.w;
+    }
+    *reinterpret_cast<float4 *>(dst + dbase + col0) = out;
+}
+
 // Fused LAYER norm + (broadcast) mul [+ (broadcast) add] — same shape/broadcast
 // contract as rms_norm_mul_f32_cuda below, but with mean-subtracting norm math.
 static void norm_mul_f32_cuda(const float *  x,
@@ -362,6 +491,55 @@ static void norm_mul_f32_cuda(const float *  x,
     const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+    // Hoisted above the vectorized block below: init_fastdiv_values asserts a
+    // non-zero divisor, so these are only computed when there is an add at all.
+    const uint3 add_ncols_packed     = add ? init_fastdiv_values(add_ncols)         : make_uint3(0, 0, 0);
+    const uint3 add_nrows_packed     = add ? init_fastdiv_values(add_nrows)         : make_uint3(0, 0, 0);
+    const uint3 add_nchannels_packed = add ? init_fastdiv_values(add_nchannels)     : make_uint3(0, 0, 0);
+    const uint3 add_nsamples_packed  = add ? init_fastdiv_values(add_nsamples)      : make_uint3(0, 0, 0);
+
+    // EWI-1963 kernel sweep: vectorized fused path. Taken only when the row
+    // fits one 4-wide access per thread and every pointer the kernel dereferences
+    // is 16-byte aligned on a four-float boundary; otherwise the scalar kernels
+    // below run exactly as before.
+    {
+        constexpr int BS = 256;
+        const bool mul_ok =
+            mul_ncols >= (uint32_t) ncols &&
+            mul_stride_row % NORM_F32_VEC == 0 &&
+            mul_stride_channel % NORM_F32_VEC == 0 &&
+            mul_stride_sample % NORM_F32_VEC == 0 &&
+            ((uintptr_t) mul) % 16 == 0;
+        const bool add_ok = add == nullptr ||
+            (add_ncols >= (uint32_t) ncols &&
+             add_stride_row % NORM_F32_VEC == 0 &&
+             add_stride_channel % NORM_F32_VEC == 0 &&
+             add_stride_sample % NORM_F32_VEC == 0 &&
+             ((uintptr_t) add) % 16 == 0);
+        const bool vec_ok =
+            ncols >= NORM_F32_VEC && ncols % NORM_F32_VEC == 0 && ncols <= NORM_F32_VEC * BS &&
+            stride_row % NORM_F32_VEC == 0 &&
+            ((uintptr_t) x) % 16 == 0 && ((uintptr_t) dst) % 16 == 0 &&
+            mul_ok && add_ok;
+        if (vec_ok) {
+            const dim3 block_dims(BS, 1, 1);
+            const dim3 vblocks_num(nrows, nchannels, nsamples);
+            const unsigned smem = 32 * sizeof(float2);
+            if (add == nullptr) {
+                norm_f32_vec<BS, true, false><<<vblocks_num, block_dims, smem, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
+                    mul_stride_channel, mul_stride_sample, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+            } else {
+                norm_f32_vec<BS, true, true><<<vblocks_num, block_dims, smem, stream>>>(
+                    x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
+                    mul_stride_channel, mul_stride_sample, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows_packed, add_nchannels_packed,
+                    add_nsamples_packed);
+            }
+            return;
+        }
+    }
+
     if (add == nullptr) {
         if (ncols < 1024) {
             const dim3 block_dims(WARP_SIZE, 1, 1);
@@ -375,10 +553,6 @@ static void norm_mul_f32_cuda(const float *  x,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
         }
     } else {
-        const uint3 add_ncols_packed     = init_fastdiv_values(add_ncols);
-        const uint3 add_nrows_packed     = init_fastdiv_values(add_nrows);
-        const uint3 add_nchannels_packed = init_fastdiv_values(add_nchannels);
-        const uint3 add_nsamples_packed  = init_fastdiv_values(add_nsamples);
         if (ncols < 1024) {
             const dim3 block_dims(WARP_SIZE, 1, 1);
             norm_f32<WARP_SIZE, true, true><<<blocks_num, block_dims, 0, stream>>>(
