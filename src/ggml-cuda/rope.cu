@@ -284,7 +284,8 @@ static __global__ void rope_vision(const T *            x,
                                    const rope_corr_dims corr_dims,
                                    const float          theta_scale,
                                    const float *        freq_factors,
-                                   const mrope_sections sections) {
+                                   const mrope_sections sections,
+                                   const int            nr) {
     const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
@@ -292,6 +293,11 @@ static __global__ void rope_vision(const T *            x,
     }
 
     const int row_dst = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (row_dst >= nr) {
+        return;
+    }
+
 
     const uint32_t i3 = row_dst / (ne01 * ne02);
     const uint32_t i2 = (row_dst - i3 * ne01 * ne02) / ne01;
@@ -477,9 +483,28 @@ static void rope_vision_cuda(const T *            x,
                              const mrope_sections sections,
                              cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
-    const dim3 block_nums(nr, n_blocks_x, 1);
+    // EWI-1963 kernel sweep. The original geometry was a fixed
+    // block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1) with one x-block per row, so for
+    // any head dim below 2*CUDA_ROPE_BLOCK_SIZE (the ViT this serves: head dim
+    // 64, i.e. 32 active y-threads of 256 launched) seven eighths of every
+    // block returned at the `i0 >= ne00` guard without touching memory, and
+    // each block's 8 warps carried exactly one warp of useful work -- an SM
+    // could hold 8 blocks and therefore only 8 working warps of its 64 slots.
+    //
+    // The row mapping `i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y)` and
+    // `row_dst = blockDim.x*blockIdx.x + threadIdx.x` is kept exactly as it
+    // was; only the *shape* of the launch changes. When a row needs fewer than
+    // CUDA_ROPE_BLOCK_SIZE y-threads, the spare y-slots become x-slots
+    // (rows), so every thread in the block has a row and a pair to work on.
+    // For ne00 >= 2*CUDA_ROPE_BLOCK_SIZE this reproduces the old launch
+    // exactly. Each element's arithmetic is untouched, so this is
+    // bit-identical to the kernel it replaces.
+    const int  pairs      = ne00 / 2;
+    const int  ry         = pairs > 0 && pairs < CUDA_ROPE_BLOCK_SIZE ? pairs : CUDA_ROPE_BLOCK_SIZE;
+    const int  rx         = CUDA_ROPE_BLOCK_SIZE / ry;
+    const int  n_blocks_x = (pairs + ry - 1) / ry;
+    const dim3 block_dims(rx, ry, 1);
+    const dim3 block_nums((nr + rx - 1) / rx, n_blocks_x, 1);
     // break down (head_dim, heads, seq) into (CUDA_ROPE_BLOCK_SIZE, x, heads * seq)
     // where x ~= ceil(head_dim / CUDA_ROPE_BLOCK_SIZE);
 
@@ -488,11 +513,11 @@ static void rope_vision_cuda(const T *            x,
     if (freq_factors == nullptr) {
         rope_vision<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections);
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, nr);
     } else {
         rope_vision<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, sections);
+            attn_factor, corr_dims, theta_scale, freq_factors, sections, nr);
     }
 }
 
