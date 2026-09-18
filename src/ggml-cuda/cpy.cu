@@ -1,6 +1,8 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+
+#include <type_traits>
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -197,6 +199,30 @@ cudaStream_t stream) {
         (cx, cdst, ne);
 }
 
+// EWI-1963 f16-stream. See the dispatch note in ggml_cpy_scalar_cuda.
+static __global__ void cpy_f32_f16_vec4(
+        const char * __restrict__ cx, char * __restrict__ cdst, const int64_t ne,
+        const int64_t ne00v, const int64_t ne01, const int64_t ne02,
+        const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= ne) {
+        return;
+    }
+    const int64_t i03 = i / (ne00v*ne01*ne02);
+    const int64_t i02 = (i - i03*ne00v*ne01*ne02) / (ne00v*ne01);
+    const int64_t i01 = (i - i03*ne00v*ne01*ne02 - i02*ne00v*ne01) / ne00v;
+    const int64_t i00 = i - i03*ne00v*ne01*ne02 - i02*ne00v*ne01 - i01*ne00v;
+
+    const char * s = cx   + i00*(4*sizeof(float)) + i01*nb01 + i02*nb02 + i03*nb03;
+    char *       d = cdst + i00*(4*sizeof(half))  + i01*nb11 + i02*nb12 + i03*nb13;
+
+    const float4 v = *reinterpret_cast<const float4 *>(s);
+    half2 * dh = reinterpret_cast<half2 *>(d);
+    dh[0] = __float22half2_rn(make_float2(v.x, v.y));
+    dh[1] = __float22half2_rn(make_float2(v.z, v.w));
+}
+
 template<typename src_t, typename dst_t, bool transposed = false>
 static void ggml_cpy_scalar_cuda(
     const char * cx, char * cdst, const int64_t ne,
@@ -211,6 +237,43 @@ static void ggml_cpy_scalar_cuda(
         cpy_scalar<cpy_1_scalar<src_t, dst_t>><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
             (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     };
+
+    // EWI-1963 f16-stream: vectorized non-contiguous copy. `ggml_cast(K, F16)`
+    // in sam3's ViT block hands this a permuted [HD, N, NH, B] f32 view whose
+    // innermost dim is contiguous (nb00 == 4) but whose outer dims are strided,
+    // so `contiguous_srcs` is false and the scalar kernel above runs: one
+    // element per thread, and a 64-bit division plus three 64-bit modulos per
+    // 6-byte payload. The same 4-D decomposition applies with the innermost dim
+    // replaced by a VEC-wide vector index, so the outer index math is paid once
+    // per VEC elements instead of once per element.
+    //
+    // Bit-identical: same elements, same `__float22half2_rn` conversion per
+    // lane as `cpy_1_scalar`'s `ggml_cuda_cast<half>(float)`. Only taken when
+    // every stride that reaches the vector base is aligned for the 16-byte
+    // load and the 4-byte half2 stores; otherwise the scalar kernel runs.
+    if (!transposed && std::is_same_v<src_t, float> && std::is_same_v<dst_t, half>) {
+        constexpr int64_t VEC = 4;
+        const bool ok =
+            ne00 == ne10 && ne01 == ne11 && ne02 == ne12 &&
+            nb00 == (int64_t) sizeof(float) && nb10 == (int64_t) sizeof(half) &&
+            ne00 % VEC == 0 &&
+            (reinterpret_cast<uintptr_t>(cx)   % 16 == 0) &&
+            (reinterpret_cast<uintptr_t>(cdst) %  4 == 0) &&
+            nb01 % 16 == 0 && nb02 % 16 == 0 && nb03 % 16 == 0 &&
+            nb11 %  4 == 0 && nb12 %  4 == 0 && nb13 %  4 == 0 &&
+            ne % VEC == 0;
+        if (ok) {
+            const int64_t ne00v = ne00 / VEC;
+            const int64_t nev   = ne / VEC;
+            const int64_t num_blocks = (nev + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+            if (num_blocks <= INT_MAX) {
+                cpy_f32_f16_vec4<<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
+                    cx, cdst, nev, ne00v, ne01, ne02,
+                    nb01, nb02, nb03, nb11, nb12, nb13);
+                return;
+            }
+        }
+    }
 
     if (transposed) {
         GGML_ASSERT(ne == ne00*ne01*ne02);  // ne[3] is 1 assumed
