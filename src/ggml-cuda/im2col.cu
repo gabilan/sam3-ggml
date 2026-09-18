@@ -41,6 +41,65 @@ static  __global__ void im2col_kernel(
     GGML_UNUSED(KH);
 }
 
+// EWI-1963 f16-stream: identical index decomposition, with the three divisions
+// done by an invariant multiply instead of a 64-bit integer divide.
+//
+// The kernel above divides by KH_KW, KW and OH -- all RUNTIME values, so nvcc
+// emits the full 64-bit division subroutine for each: three per thread, on a
+// kernel that is one thread per output element with no other work to hide it.
+// Measured, this is the most expensive im2col launch in the encode: the
+// 3x3/256ch/288x288 neck conv is 1086 us (54% of all im2col time in the encode)
+// at ~118 GB/s, against ~625 GB/s for the fully coalesced 1x1 shape at the same
+// resolution -- issue-bound, not bandwidth-bound.
+//
+// `fast_div_modulo` is the Granlund-Montgomery invariant-integer division
+// already used elsewhere in this backend (convert.cu, norm.cu). It produces the
+// SAME quotient and remainder for the same n and d (common.cuh:840: the
+// derivation is valid for every d in [1, 2^32)), so every index below is the
+// identical integer the divide would have produced and the kernel writes the
+// identical bytes. Only the cost of computing them changes.
+template <typename T>
+static __global__ void im2col_kernel_fastdiv(
+        const float * x, T * dst,
+        int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
+        int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
+        int s0, int s1, int p0, int p1, int d0, int d1,
+        uint3 KH_KW_fdv, uint3 KW_fdv, uint3 OH_fdv) {
+    const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= IC_KH_KW) {
+        return;
+    }
+
+    const uint2 d_i   = fast_div_modulo((uint32_t) i, KH_KW_fdv);
+    const int64_t iic = d_i.x;
+    const uint2 d_r   = fast_div_modulo(d_i.y, KW_fdv);
+    const int64_t ikh = d_r.x;
+    const int64_t ikw = d_r.y;
+
+    const int64_t  iow = blockIdx.y;
+    for (int64_t iz = blockIdx.z; iz < N_OH; iz+=MAX_GRIDDIM_Z) {
+        const uint2 d_z    = fast_div_modulo((uint32_t) iz, OH_fdv);
+        const int64_t  in  = d_z.x;
+        const int64_t  ioh = d_z.y;
+
+        const int64_t iiw = iow * s0 + ikw * d0 - p0;
+        const int64_t iih = ioh * s1 + ikh * d1 - p1;
+
+        const int64_t offset_dst =
+            ((in * OH + ioh) * OW + iow) * IC_KH_KW + iic * KH_KW + ikh * KW + ikw;
+
+        if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+            dst[offset_dst] = 0.0f;
+        } else {
+            const int64_t offset_src = iic * IC_IH_IW + in * IH_IW;
+            dst[offset_dst] = x[offset_src + iih * IW + iiw];
+        }
+    }
+
+    GGML_UNUSED(IC);
+    GGML_UNUSED(KH);
+}
+
 // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
 template <typename T>
 static void im2col_cuda(const float * x, T* dst,
@@ -52,7 +111,26 @@ static void im2col_cuda(const float * x, T* dst,
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
     dim3 block_nums(num_blocks, OW, MIN(N_OH, MAX_GRIDDIM_Z));
-    im2col_kernel<<<block_nums, MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
+    const dim3 threads(MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE));
+
+    // The fastdiv path is exact only for 32-bit dividends and divisors; the
+    // kernel above is kept verbatim as the guard for a shape that exceeds them.
+    constexpr uint64_t U32MAX = 0xffffffffull;
+    const bool fastdiv_ok =
+        (uint64_t) IC_KH_KW <= U32MAX && (uint64_t) KH_KW <= U32MAX &&
+        (uint64_t) KW      <= U32MAX && (uint64_t) OH    <= U32MAX &&
+        (uint64_t) N_OH    <= U32MAX && KH_KW > 0 && KW > 0 && OH > 0;
+
+    if (fastdiv_ok) {
+        im2col_kernel_fastdiv<T><<<block_nums, threads, 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
+            IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW, s0, s1, p0, p1, d0, d1,
+            init_fastdiv_values((uint64_t) KH_KW),
+            init_fastdiv_values((uint64_t) KW),
+            init_fastdiv_values((uint64_t) OH));
+        return;
+    }
+
+    im2col_kernel<<<block_nums, threads, 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
                                                                                      IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
                                                                                      s0, s1, p0, p1, d0, d1);
 }
